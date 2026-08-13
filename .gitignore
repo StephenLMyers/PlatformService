@@ -1,0 +1,40 @@
+# build output
+build/
+*.o
+*.d
+platformservice
+
+# database -- including SQLite's WAL sidecars
+*.db
+*.db-wal
+*.db-shm
+data/platform.db*
+
+# TLS material -- never commit keys or certs, not even dev ones
+*.pem
+*.key
+*.crt
+*.csr
+certs/
+
+# real configuration and secrets (the .example file IS tracked)
+config/platform.conf
+.env
+
+# python harness
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# fuzzing artifacts (regression corpus IS tracked)
+tests/fuzz/corpus/queue/
+crash-*
+leak-*
+timeout-*
+
+# tooling output
+valgrind-*.log
+massif.out.*
+core
+core.*
