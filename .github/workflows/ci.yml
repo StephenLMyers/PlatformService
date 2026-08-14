@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Phase 1 scope. The full job matrix from plan section 16 -- sanitizers,
+# memory budgets, serial rate-limit tests, valgrind, and fuzzing -- lands as
+# the code those jobs exercise is written.
+jobs:
+  build:
+    name: Build and check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config
+
+      - name: Build with warnings as errors
+        run: make
+
+      - name: Banned function check
+        run: make check-banned
+
+      - name: Configuration validates
+        env:
+          # A throwaway value for CI only. Deliberately a workflow env var and
+          # not a repository secret: storing it as a secret would imply it
+          # guards something, and it does not.
+          PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+        run: make check-config
+
+      - name: Starts and shuts down cleanly on SIGTERM
+        env:
+          PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+        run: |
+          ./build/platformservice > run.log 2>&1 &
+          pid=$!
+          sleep 2
+          kill -TERM $pid
+          wait $pid
+          rc=$?
+          cat run.log
+          test $rc -eq 0
+          grep -q "shutdown complete" run.log
+
+  memcheck:
+    name: Valgrind
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config valgrind
+
+      - name: Build
+        run: make
+
+      # Gates on definite and indirect leaks only. "Still reachable" is
+      # expected from OpenSSL's one-time init and is not a defect; failing on
+      # it would train everyone to ignore this job.
+      - name: Leak check
+        env:
+          PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+        run: |
+          valgrind --leak-check=full \
+                   --show-leak-kinds=definite,indirect \
+                   --errors-for-leak-kinds=definite,indirect \
+                   --error-exitcode=1 \
+                   ./build/platformservice --check-config

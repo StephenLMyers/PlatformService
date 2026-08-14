@@ -933,8 +933,8 @@ larger than this service). So:
   homoglyphs and confusables — and does it more decisively.
 
 **Breach denylist asset.** `data/common-passwords.txt` — the **top 10,000** passwords from a public
-breach corpus (SecLists `10-million-password-list-top-10000`), one per line, lowercase, LF-terminated,
-sorted, and committed to the repository (~80 KB). Loaded into a hash set at startup; lookup is on the
+breach corpus (SecLists `Passwords/Common-Credentials/10k-most-common.txt`), one per line, lowercase,
+LF-terminated, sorted unique, and committed to the repository (10,000 entries, 73 KB). Loaded into a hash set at startup; lookup is on the
 lowercased candidate. Ten thousand entries catch the overwhelming majority of real-world guessing
 attempts while staying small enough to bundle and load instantly. A k-anonymity API lookup against a
 live breach service would cover more, but adds a network dependency on the registration path and is
