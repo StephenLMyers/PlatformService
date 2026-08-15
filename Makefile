@@ -9,9 +9,12 @@ SRC_DIR      := src
 
 CC           ?= gcc
 
-# -D_POSIX_C_SOURCE is required because -std=c99 alone hides sigaction,
-# strdup, clock_gettime and friends behind feature-test macros.
-CPPFLAGS     := -D_POSIX_C_SOURCE=200809L -I$(SRC_DIR)
+# _GNU_SOURCE rather than _POSIX_C_SOURCE: -std=c99 alone hides sigaction and
+# clock_gettime behind feature-test macros, and since D2 makes this Linux-only
+# there is no cost to taking the GNU set. It buys accept4(SOCK_CLOEXEC), which
+# closes a real race -- with plain accept() the descriptor is briefly
+# inheritable, so a concurrent fork/exec leaks a client socket into the child.
+CPPFLAGS     := -D_GNU_SOURCE -I$(SRC_DIR)
 
 WARNINGS     := -Wall -Wextra -Werror \
                 -Wshadow -Wpointer-arith -Wcast-qual -Wwrite-strings \
@@ -23,6 +26,16 @@ CFLAGS       += -std=c99 $(WARNINGS) -fno-common -MMD -MP
 LDFLAGS      :=
 LDLIBS       := -pthread
 
+# Optional sanitizer flags, e.g.:
+#   make clean && make SANFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+#   make clean && make test SANFLAGS="-fsanitize=thread"
+# ASan/UBSan and TSan are mutually exclusive in one binary, and build/ caches
+# objects by path, not by flag set -- always `make clean` first when changing
+# this between builds, or sanitized and plain objects get linked together.
+SANFLAGS     ?=
+CFLAGS       += $(SANFLAGS)
+LDFLAGS      += $(SANFLAGS)
+
 PKGS         := openssl sqlite3
 CPPFLAGS     += $(shell pkg-config --cflags $(PKGS))
 LDLIBS       += $(shell pkg-config --libs $(PKGS))
@@ -31,11 +44,21 @@ SRCS         := $(shell find $(SRC_DIR) -name '*.c')
 OBJS         := $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS         := $(OBJS:.o=.d)
 
+# Everything except main.o, so a test binary can link the real platform code
+# and supply its own main() instead.
+LIB_OBJS     := $(filter-out $(BUILD_DIR)/$(SRC_DIR)/main.o,$(OBJS))
+
+# One binary per tests/unit/test_*.c, each a standalone translation unit with
+# its own main() -- there is no shared test framework dependency (plan D1).
+TEST_DIR     := tests/unit
+TEST_SRCS    := $(wildcard $(TEST_DIR)/test_*.c)
+TEST_BINS    := $(TEST_SRCS:$(TEST_DIR)/%.c=$(BUILD_DIR)/$(TEST_DIR)/%)
+
 CERT_DIR     := certs
 CERT         := $(CERT_DIR)/dev-cert.pem
 KEY          := $(CERT_DIR)/dev-key.pem
 
-.PHONY: all clean run check-config dev-cert dev-env check-banned memcheck help
+.PHONY: all clean run check-config dev-cert dev-env check-banned memcheck test help
 
 all: $(BUILD_DIR)/$(BIN)
 
@@ -49,6 +72,24 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 -include $(DEPS)
+
+# Test binaries link the real object files, so they exercise the same code
+# `make all` produces -- never a separately-compiled copy that could drift.
+$(BUILD_DIR)/$(TEST_DIR)/%: $(TEST_DIR)/%.c $(LIB_OBJS)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(TEST_DIR) $< $(LIB_OBJS) $(LDLIBS) -o $@
+
+test: $(TEST_BINS)
+	@if [ -z "$(TEST_BINS)" ]; then \
+	    echo "no unit tests in $(TEST_DIR)"; \
+	    exit 0; \
+	fi; \
+	status=0; \
+	for t in $(TEST_BINS); do \
+	    echo "-- $$t --"; \
+	    ./$$t || status=1; \
+	done; \
+	exit $$status
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -110,4 +151,5 @@ help:
 	@echo "  make dev-env       generate an untracked .env with secrets"
 	@echo "  make check-banned  fail on banned unbounded string functions"
 	@echo "  make memcheck      run under valgrind"
+	@echo "  make test          build and run C unit tests (tests/unit/)"
 	@echo "  make clean         remove build output"

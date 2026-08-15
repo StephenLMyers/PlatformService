@@ -78,11 +78,11 @@ static const ps_setting_t SETTINGS[] = {
     { "auth.password_max_length",   "PS_PASSWORD_MAX_LENGTH",    T_INT,      FIELD(password_max_length),  "128",               false, false },
     { "auth.jwt_issuer",            "PS_JWT_ISSUER",             T_STR,      FIELD(jwt_issuer),           "platformservice",   false, false },
     { "auth.jwt_audience",          "PS_JWT_AUDIENCE",           T_STR,      FIELD(jwt_audience),         "platformservice-api", false, false },
-    { NULL,                         "PS_JWT_SECRET",             T_STR,      FIELD(jwt_secret),           "",                  true,  true  },
+    { "auth.jwt_secret",             "PS_JWT_SECRET",             T_STR,      FIELD(jwt_secret),           "",                  true,  true  },
 
-    { NULL,  "BOOTSTRAP_ADMIN_USERNAME", T_STR, FIELD(bootstrap_admin_username), "",                      false, true },
-    { NULL,  "BOOTSTRAP_ADMIN_EMAIL",    T_STR, FIELD(bootstrap_admin_email),    "",                      false, true },
-    { NULL,  "BOOTSTRAP_ADMIN_PASSWORD", T_STR, FIELD(bootstrap_admin_password), "",                      true,  true },
+    { "bootstrap.admin_username", "BOOTSTRAP_ADMIN_USERNAME", T_STR, FIELD(bootstrap_admin_username), "",                      false, true },
+    { "bootstrap.admin_email",    "BOOTSTRAP_ADMIN_EMAIL",    T_STR, FIELD(bootstrap_admin_email),    "",                      false, true },
+    { "bootstrap.admin_password", "BOOTSTRAP_ADMIN_PASSWORD", T_STR, FIELD(bootstrap_admin_password), "",                      true,  true },
 
     { "maintenance.interval_s",     "PS_MAINTENANCE_INTERVAL_S", T_INT,      FIELD(maintenance_interval_s), "3600",            false, false },
     { "maintenance.batch_size",     "PS_MAINTENANCE_BATCH_SIZE", T_INT,      FIELD(maintenance_batch_size), "1000",            false, false },

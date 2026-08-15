@@ -38,3 +38,6 @@ valgrind-*.log
 massif.out.*
 core
 core.*
+
+# working notes, not part of the project record
+plans/gotchas.md

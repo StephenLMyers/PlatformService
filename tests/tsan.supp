@@ -1,0 +1,19 @@
+# ThreadSanitizer suppressions for PlatformService.
+#
+# These match known-benign, out-of-our-control races reported inside library
+# internals: OpenSSL 3.x's lock-free algorithm-fetch cache, and glibc's
+# pthread_create stack-cache reuse. Neither has ever shown a single frame
+# from this project's own code -- confirmed with Helgrind during development
+# of the phase-2 net/tls/threadpool/conn/server modules, where both patterns
+# showed up entirely inside libcrypto.so and glibc's pthread implementation.
+#
+# `make test SANFLAGS="-fsanitize=thread"` is currently clean with zero
+# findings even without these; they're kept as a documented safety net,
+# since sanitizer output can depend on thread scheduling and CI runner load.
+
+race:libcrypto
+race:OSSL_LIB_CTX_get0_global_default
+race:EVP_KEM_fetch
+race:allocate_stack
+race:get_cached_stack
+race:_dl_allocate_tls

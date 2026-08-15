@@ -1,10 +1,11 @@
 /*
  * PlatformService -- entry point.
  *
- * Phase 1 scope: start up, load and validate configuration, install signal
- * handling, then shut down cleanly. The listener, TLS, and request handling
- * arrive in phases 2-3; the shutdown sequence below is already shaped to
- * accommodate them (plan 7.2a).
+ * Phase 2 scope: start up, load and validate configuration, install signal
+ * handling, open a TLS listener, dispatch accepted connections to a worker
+ * pool, and shut down gracefully within a bounded grace period (plan 7.2a).
+ * Request handling is still a placeholder line protocol (see platform/conn.h);
+ * real HTTP/1.1 parsing and routing arrive in phase 3.
  */
 #include <errno.h>
 #include <pthread.h>
@@ -17,8 +18,10 @@
 
 #include "platform/config.h"
 #include "platform/log.h"
+#include "platform/server.h"
+#include "platform/tls.h"
 
-#define PS_VERSION "0.1.0-phase1"
+#define PS_VERSION "0.2.0-phase2"
 
 typedef struct {
     const char *config_path;
@@ -132,6 +135,12 @@ static const char *signal_name(int sig)
     }
 }
 
+static void *acceptor_thread_fn(void *arg)
+{
+    ps_server_run((ps_server_t *)arg);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     ps_args_t   args;
@@ -194,17 +203,64 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /*
-     * Phases 2-3 start the listener, TLS context, thread pool, and maintenance
-     * thread here. Until then startup is complete at this point.
-     */
-    PS_INFO("startup complete; listening is not yet implemented (phase 1)");
+    if (!cfg.tls_enabled) {
+        PS_ERROR("tls.enabled=false: no plaintext mode is implemented yet "
+                 "(plan R1); refusing to start");
+        goto cleanup;
+    }
+
+    ps_server_t server;
+    if (!ps_listener_open(&server.listener, cfg.bind_address, cfg.port,
+                          cfg.accept_queue_depth, err, sizeof err)) {
+        PS_ERROR("failed to open listener: %s", err);
+        goto cleanup;
+    }
+
+    server.tls_ctx = ps_tls_ctx_create(cfg.tls_cert_path, cfg.tls_key_path, err, sizeof err);
+    if (server.tls_ctx == NULL) {
+        PS_ERROR("failed to initialize TLS: %s", err);
+        ps_listener_close(&server.listener);
+        goto cleanup;
+    }
+
+    /* worker_threads/accept_queue_depth double as both the thread pool size
+     * and its job queue capacity -- the config file has one knob for each,
+     * not a separate pair per consumer. */
+    server.pool = ps_threadpool_create(cfg.worker_threads, cfg.accept_queue_depth,
+                                       err, sizeof err);
+    if (server.pool == NULL) {
+        PS_ERROR("failed to start worker pool: %s", err);
+        ps_tls_ctx_free(server.tls_ctx);
+        ps_listener_close(&server.listener);
+        goto cleanup;
+    }
+
+    server.conn_limits.read_timeout_s         = cfg.read_timeout_s;
+    server.conn_limits.write_timeout_s        = cfg.write_timeout_s;
+    server.conn_limits.keepalive_max_requests = cfg.keepalive_max_requests;
+
+    pthread_t acceptor_thread;
+    int       prc = pthread_create(&acceptor_thread, NULL, acceptor_thread_fn, &server);
+    if (prc != 0) {
+        PS_ERROR("pthread_create: %s", strerror(prc));
+        ps_threadpool_shutdown(server.pool, false);
+        ps_threadpool_destroy(server.pool);
+        ps_tls_ctx_free(server.tls_ctx);
+        ps_listener_close(&server.listener);
+        goto cleanup;
+    }
+
+    PS_INFO("listening on %s:%u (TLS)", cfg.bind_address, (unsigned)cfg.port);
     PS_INFO("send SIGTERM or press Ctrl-C to shut down");
 
     int sig = 0;
     int rc  = sigwait(&waitset, &sig);
     if (rc != 0) {
         PS_ERROR("sigwait: %s", strerror(rc));
+        /* The server is fully up; tear it down the same way a signal would. */
+        (void)ps_server_shutdown(&server, cfg.shutdown_grace_s);
+        (void)pthread_join(acceptor_thread, NULL);
+        ps_listener_close(&server.listener);
         goto cleanup;
     }
 
@@ -216,10 +272,22 @@ int main(int argc, char **argv)
      *   2. stop accepting, keep draining in-flight requests
      *   3. wait up to shutdown_grace_s for workers
      *   4. checkpoint and close the database, free the TLS context
-     * Steps 1-3 become real in phases 2-3; step 4 in phase 5.
+     * Step 1 (/readyz) and the database half of step 4 land with phases 3/5.
      */
-    PS_DEBUG("shutdown grace period is %ds", cfg.shutdown_grace_s);
-    PS_INFO("shutdown complete");
+    bool drained = ps_server_shutdown(&server, cfg.shutdown_grace_s);
+    (void)pthread_join(acceptor_thread, NULL);
+    ps_listener_close(&server.listener); /* safe only now the acceptor has actually exited */
+
+    if (drained) {
+        ps_tls_ctx_free(server.tls_ctx);
+        PS_INFO("shutdown complete");
+    } else {
+        /* server.pool is deliberately left running and unfreed here -- see
+         * ps_server_shutdown's contract. Process exit reclaims it; nothing
+         * frees memory a straggler worker might still be touching. */
+        PS_WARN("shutdown grace period (%ds) exceeded; exiting with work "
+                "still in flight", cfg.shutdown_grace_s);
+    }
     exit_code = EXIT_SUCCESS;
 
 cleanup:

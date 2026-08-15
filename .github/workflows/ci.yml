@@ -6,9 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Phase 1 scope. The full job matrix from plan section 16 -- sanitizers,
-# memory budgets, serial rate-limit tests, valgrind, and fuzzing -- lands as
-# the code those jobs exercise is written.
+# Phase 2 scope: sanitizers (ASan/UBSan) and Valgrind now cover real listener/
+# TLS/thread-pool code, and a ThreadSanitizer job is added beyond plan section
+# 16's matrix -- phase 2 is the first code in the project with real
+# concurrency (plan 3.3), which is exactly what TSan exists to catch, added
+# deliberately rather than waiting for a race to actually appear. Memory
+# budgets, serial rate-limit tests, and fuzzing land as the code those jobs
+# exercise is written.
 jobs:
   build:
     name: Build and check
@@ -27,6 +31,9 @@ jobs:
       - name: Banned function check
         run: make check-banned
 
+      - name: Unit tests
+        run: make test
+
       - name: Configuration validates
         env:
           # A throwaway value for CI only. Deliberately a workflow env var and
@@ -35,19 +42,85 @@ jobs:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
         run: make check-config
 
-      - name: Starts and shuts down cleanly on SIGTERM
+      - name: Generate dev cert
+        run: make dev-cert
+
+      - name: Starts, serves a TLS connection, and shuts down cleanly on SIGTERM
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
         run: |
           ./build/platformservice > run.log 2>&1 &
           pid=$!
-          sleep 2
+          sleep 1
+          printf 'one\ntwo\n' | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null \
+            | tee client.log
+          grep -q "ps-ack 1" client.log
+          grep -q "ps-ack 2" client.log
           kill -TERM $pid
           wait $pid
           rc=$?
           cat run.log
           test $rc -eq 0
           grep -q "shutdown complete" run.log
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config
+
+      # -fno-sanitize-recover=undefined: UBSan otherwise prints and continues,
+      # which would let real undefined behavior pass CI silently.
+      - name: Build and run unit tests under ASan/UBSan
+        run: |
+          make SANFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+          make test SANFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+
+      - name: Generate dev cert
+        run: make dev-cert
+
+      - name: Starts, serves a TLS connection, and shuts down cleanly under ASan/UBSan
+        env:
+          PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+        run: |
+          ./build/platformservice > run.log 2>&1 &
+          pid=$!
+          sleep 1
+          printf 'one\ntwo\n' | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null
+          kill -TERM $pid
+          wait $pid
+          rc=$?
+          cat run.log
+          test $rc -eq 0
+          grep -q "shutdown complete" run.log
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config
+
+      # Known-benign, out-of-our-control races reported here (see
+      # tests/tsan.supp) are inside OpenSSL 3.x's own internal algorithm-fetch
+      # cache and glibc's pthread_create stack-cache reuse -- neither has a
+      # single frame in this project's code, and both are documented,
+      # recognized false-positive classes for exactly this kind of sanitizer.
+      - name: Build and run unit tests under ThreadSanitizer
+        env:
+          TSAN_OPTIONS: suppressions=tests/tsan.supp
+        run: |
+          make SANFLAGS="-fsanitize=thread"
+          make test SANFLAGS="-fsanitize=thread"
 
   memcheck:
     name: Valgrind
@@ -66,7 +139,7 @@ jobs:
       # Gates on definite and indirect leaks only. "Still reachable" is
       # expected from OpenSSL's one-time init and is not a defect; failing on
       # it would train everyone to ignore this job.
-      - name: Leak check
+      - name: Leak check (config path)
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
         run: |
@@ -75,3 +148,27 @@ jobs:
                    --errors-for-leak-kinds=definite,indirect \
                    --error-exitcode=1 \
                    ./build/platformservice --check-config
+
+      - name: Generate dev cert
+        run: make dev-cert
+
+      # Same check, but over the real listener/TLS/thread-pool/shutdown path
+      # now that phase 2 has one -- --check-config alone never touches it.
+      - name: Leak check (listen, serve, shut down)
+        env:
+          PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+        run: |
+          valgrind --leak-check=full \
+                   --show-leak-kinds=definite,indirect \
+                   --errors-for-leak-kinds=definite,indirect \
+                   --error-exitcode=1 \
+                   --log-file=valgrind-run.log \
+                   ./build/platformservice &
+          pid=$!
+          sleep 2
+          printf 'one\ntwo\n' | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null
+          kill -TERM $pid
+          wait $pid
+          rc=$?
+          cat valgrind-run.log
+          test $rc -eq 0
