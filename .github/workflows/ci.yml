@@ -166,6 +166,49 @@ jobs:
       - name: Run black-box pytest suite (plan 8.1) and memory baselines (plan 8.5)
         run: make harness
 
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config python3-venv
+
+      # --coverage via SANFLAGS -- the same mechanism the sanitizer jobs
+      # use (see the Makefile comment next to SANFLAGS). The Python harness
+      # below runs against these same instrumented objects, not a
+      # separately built binary, so its counts accumulate into the same
+      # .gcda files instead of starting over: main.c, api/routes.c, and
+      # api/health_api.c are only ever exercised by the harness driving the
+      # real binary, never by a unit test, so skipping this step would
+      # undercount real coverage by leaving those files at 0%.
+      - name: Build and run C unit tests (coverage-instrumented)
+        run: |
+          make SANFLAGS="--coverage"
+          make test SANFLAGS="--coverage"
+
+      - name: Run Python harness against the same instrumented binary
+        run: make harness
+
+      - name: Generate coverage report
+        run: |
+          python3 -m venv /tmp/covenv
+          /tmp/covenv/bin/pip install --quiet gcovr==8.6
+          /tmp/covenv/bin/gcovr --root . --filter 'src/' \
+              --markdown --markdown-heading-level 2 -o coverage-summary.md build/
+          /tmp/covenv/bin/gcovr --root . --filter 'src/' \
+              --html-details --html-single-page -o coverage.html build/
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage.html
+
   memcheck:
     name: Valgrind
     runs-on: ubuntu-latest
