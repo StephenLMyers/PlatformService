@@ -10,6 +10,11 @@
 
 #include "http/request.h"
 
+/* libFuzzer's own runtime supplies main() and calls this; nothing in this
+ * translation unit declares it otherwise, which -Wmissing-prototypes (the
+ * project's own warning set, applied here too) correctly flags without one. */
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     static const ps_http_limits_t limits = {
