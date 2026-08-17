@@ -40,6 +40,30 @@ for fn in "${BANNED[@]}"; do
     fi
 done
 
+# audit_log is append-only by construction (plan 6.10): no UPDATE or DELETE
+# against it exists anywhere except the maintenance retention sweep. Rather
+# than pattern-match SQL text (the sweep builds its statement from a
+# runtime table-name argument, not a literal "DELETE FROM audit_log"
+# string, so a text grep for that phrase wouldn't even see it), this
+# restricts which files may reference the table by name at all: only the
+# module that writes/reads it and the module that sweeps it.
+AUDIT_LOG_ALLOWED_FILES="src/store/audit_store.c src/store/audit_store.h src/platform/maintenance.c"
+audit_hits=$(grep -rnw --include='*.c' --include='*.h' 'audit_log' "$SRC_DIR" 2>/dev/null || true)
+if [ -n "$audit_hits" ]; then
+    bad_audit_hits=$(echo "$audit_hits" | while IFS=: read -r file _; do
+        allowed=0
+        for f in $AUDIT_LOG_ALLOWED_FILES; do
+            [ "$file" = "$f" ] && allowed=1 && break
+        done
+        [ "$allowed" -eq 0 ] && echo "$file"
+    done)
+    if [ -n "$bad_audit_hits" ]; then
+        echo "BANNED: audit_log referenced outside $AUDIT_LOG_ALLOWED_FILES"
+        echo "$audit_hits" | sed 's/^/    /'
+        STATUS=1
+    fi
+fi
+
 if [ "$STATUS" -eq 0 ]; then
     echo "check-banned: clean (${#BANNED[@]} patterns, no violations)"
 else

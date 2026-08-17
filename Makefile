@@ -14,7 +14,7 @@ CC           ?= gcc
 # there is no cost to taking the GNU set. It buys accept4(SOCK_CLOEXEC), which
 # closes a real race -- with plain accept() the descriptor is briefly
 # inheritable, so a concurrent fork/exec leaks a client socket into the child.
-CPPFLAGS     := -D_GNU_SOURCE -I$(SRC_DIR)
+CPPFLAGS     := -D_GNU_SOURCE -I$(SRC_DIR) -I$(BUILD_DIR)
 
 WARNINGS     := -Wall -Wextra -Werror \
                 -Wshadow -Wpointer-arith -Wcast-qual -Wwrite-strings \
@@ -91,6 +91,23 @@ $(BUILD_DIR)/$(BIN): $(OBJS)
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# The migration SQL is embedded into the binary rather than read from disk
+# at startup (plan 5): unlike certs/config/the common-passwords denylist,
+# it must always exactly match what the compiled queries expect, so it
+# travels with the binary instead of being a separate deployable that could
+# drift from it. The .sql file stays the readable, single source of truth;
+# this rule is the only place its content is duplicated.
+$(BUILD_DIR)/generated/schema_001_init.h: $(SRC_DIR)/store/schema/001_init.sql
+	@mkdir -p $(@D)
+	@{ \
+	  echo '/* Generated from $< by the Makefile -- do not edit directly. */'; \
+	  echo 'static const char PS_SCHEMA_001_INIT[] ='; \
+	  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/    "/' -e 's/$$/\\n"/' $<; \
+	  echo ';'; \
+	} > $@
+
+$(BUILD_DIR)/$(SRC_DIR)/store/db.o: $(BUILD_DIR)/generated/schema_001_init.h
 
 -include $(DEPS)
 

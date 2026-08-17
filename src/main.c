@@ -1,12 +1,17 @@
 /*
  * PlatformService -- entry point.
  *
- * Phase 3 scope: start up, load and validate configuration, install signal
+ * Phase 5 adds the data layer: a SQLite connection pool (migrated to the
+ * current schema on first open) and a dedicated maintenance-sweep thread,
+ * both opened before the listener so a database failure is caught before
+ * any socket is bound, and both torn down as shutdown step 4 (plan 7.2a).
+ *
+ * Otherwise as before: load and validate configuration, install signal
  * handling, open a TLS listener, register the real route table, dispatch
  * accepted connections to a worker pool that actually parses/routes/
  * responds to HTTP requests, and shut down gracefully within a bounded
- * grace period (plan 7.2a). main.c is the one place allowed to depend on
- * every layer (platform, http/json, api) -- it's the composition root that
+ * grace period. main.c is the one place allowed to depend on every layer
+ * (platform, http/json, store, api) -- it's the composition root that
  * wires api/routes.c's concrete handlers into http/conn.c's generic
  * dispatch callback, so neither has to depend on the other directly.
  */
@@ -22,10 +27,12 @@
 #include "api/routes.h"
 #include "platform/config.h"
 #include "platform/log.h"
+#include "platform/maintenance.h"
 #include "platform/tls.h"
 #include "server.h"
+#include "store/db.h"
 
-#define PS_VERSION "0.3.0-phase3"
+#define PS_VERSION "0.5.0-phase5"
 
 typedef struct {
     const char *config_path;
@@ -231,6 +238,27 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* DB pool sized to worker_threads too (0 = one per CPU, resolved
+     * independently by each -- see db.c). Opened before the listener so a
+     * database failure is caught before any socket is bound (plan 5). */
+    ps_db_pool_t *db_pool = ps_db_pool_create(cfg.db_path, cfg.worker_threads,
+                                              cfg.db_busy_timeout_ms, err, sizeof err);
+    if (db_pool == NULL) {
+        PS_ERROR("failed to open database: %s", err);
+        goto cleanup;
+    }
+
+    /* Its own connection, independent of db_pool (plan 3.4) -- a slow sweep
+     * must never compete with a request-handling worker for a connection. */
+    ps_maintenance_t *maintenance = ps_maintenance_start(
+        cfg.db_path, cfg.db_busy_timeout_ms, cfg.maintenance_interval_s,
+        cfg.maintenance_batch_size, cfg.audit_retention_days, err, sizeof err);
+    if (maintenance == NULL) {
+        PS_ERROR("failed to start maintenance thread: %s", err);
+        ps_db_pool_destroy(db_pool);
+        goto cleanup;
+    }
+
     ps_server_t server;
     server.draining = false;
     server.cors     = &cors_policy;
@@ -238,6 +266,8 @@ int main(int argc, char **argv)
     if (!ps_listener_open(&server.listener, cfg.bind_address, cfg.port,
                           cfg.accept_queue_depth, err, sizeof err)) {
         PS_ERROR("failed to open listener: %s", err);
+        ps_maintenance_stop(maintenance);
+        ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
 
@@ -245,6 +275,8 @@ int main(int argc, char **argv)
     if (server.tls_ctx == NULL) {
         PS_ERROR("failed to initialize TLS: %s", err);
         ps_listener_close(&server.listener);
+        ps_maintenance_stop(maintenance);
+        ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
 
@@ -257,6 +289,8 @@ int main(int argc, char **argv)
         PS_ERROR("failed to start worker pool: %s", err);
         ps_tls_ctx_free(server.tls_ctx);
         ps_listener_close(&server.listener);
+        ps_maintenance_stop(maintenance);
+        ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
 
@@ -281,6 +315,8 @@ int main(int argc, char **argv)
         ps_threadpool_destroy(server.pool);
         ps_tls_ctx_free(server.tls_ctx);
         ps_listener_close(&server.listener);
+        ps_maintenance_stop(maintenance);
+        ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
 
@@ -295,6 +331,8 @@ int main(int argc, char **argv)
         (void)ps_server_shutdown(&server, cfg.shutdown_grace_s);
         (void)pthread_join(acceptor_thread, NULL);
         ps_listener_close(&server.listener);
+        ps_maintenance_stop(maintenance);
+        ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
 
@@ -306,19 +344,24 @@ int main(int argc, char **argv)
      *   2. stop accepting, keep draining in-flight requests
      *   3. wait up to shutdown_grace_s for workers
      *   4. checkpoint and close the database, free the TLS context
-     * Step 1 (/readyz) and the database half of step 4 land with phases 3/5.
+     * The maintenance thread is independent of the request-handling pool
+     * (its own thread, its own connection), so it stops unconditionally
+     * regardless of whether step 3 drained in time.
      */
     bool drained = ps_server_shutdown(&server, cfg.shutdown_grace_s);
     (void)pthread_join(acceptor_thread, NULL);
     ps_listener_close(&server.listener); /* safe only now the acceptor has actually exited */
+    ps_maintenance_stop(maintenance);
 
     if (drained) {
         ps_tls_ctx_free(server.tls_ctx);
+        ps_db_pool_destroy(db_pool);
         PS_INFO("shutdown complete");
     } else {
         /* server.pool is deliberately left running and unfreed here -- see
-         * ps_server_shutdown's contract. Process exit reclaims it; nothing
-         * frees memory a straggler worker might still be touching. */
+         * ps_server_shutdown's contract. db_pool is left alone for the same
+         * reason: a straggler worker could still be mid-query against one of
+         * its connections. Process exit reclaims both. */
         PS_WARN("shutdown grace period (%ds) exceeded; exiting with work "
                 "still in flight", cfg.shutdown_grace_s);
     }

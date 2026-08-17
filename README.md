@@ -115,6 +115,21 @@ cached by path, not by flag set, and linking objects built with different
 sanitizers together fails with confusing linker errors rather than a clear
 message.
 
+### Database
+
+The schema (`src/store/schema/001_init.sql`) is embedded into the binary at
+build time and applied automatically on first startup — no separate
+migration step. `./data/platform.db` is created if missing; delete it
+(plus its `-wal`/`-shm` siblings) to start over.
+
+```bash
+python3 tools/seed_users.py --count 100      # deterministic test users, low-iteration hashes
+```
+
+Every seeded user shares the password printed by the script. Seeding writes
+directly to the database file — the service must have run at least once
+first so migrations have created the schema.
+
 ### Fuzzing
 
 ```bash
