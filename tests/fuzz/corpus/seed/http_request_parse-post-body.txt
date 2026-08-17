@@ -1,0 +1,6 @@
+POST /v1/auth/login HTTP/1.1
+Host: localhost
+Content-Type: application/json
+Content-Length: 42
+
+{"username":"smyers","password":"secret1"}

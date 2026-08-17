@@ -43,6 +43,10 @@ typedef struct {
     int      keepalive_idle_timeout_s;
     int      keepalive_max_requests;
 
+    /* ---- CORS (plan 7.2a) -- off by default; empty origins = disabled ---- */
+    char     cors_allowed_origins[PS_STR_MAX];  /* comma-separated, e.g. "https://a.example,https://b.example" */
+    bool     cors_allow_credentials;
+
     /* ---- tls (plan 7.1) ---- */
     bool     tls_enabled;
     char     tls_cert_path[PS_PATH_MAX];

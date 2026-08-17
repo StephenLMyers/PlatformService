@@ -60,6 +60,9 @@ static const ps_setting_t SETTINGS[] = {
     { "http.keepalive_idle_s",      "PS_KEEPALIVE_IDLE_S",       T_INT,      FIELD(keepalive_idle_timeout_s), "15",            false, false },
     { "http.keepalive_max_requests","PS_KEEPALIVE_MAX_REQUESTS", T_INT,      FIELD(keepalive_max_requests),   "100",           false, false },
 
+    { "cors.allowed_origins",       "PS_CORS_ALLOWED_ORIGINS",   T_STR,      FIELD(cors_allowed_origins),     "",              false, false },
+    { "cors.allow_credentials",     "PS_CORS_ALLOW_CREDENTIALS", T_BOOL,     FIELD(cors_allow_credentials),   "false",         false, false },
+
     { "tls.enabled",                "PS_TLS_ENABLED",            T_BOOL,     FIELD(tls_enabled),          "true",              false, false },
     { "tls.cert_path",              "PS_TLS_CERT_PATH",          T_PATH,     FIELD(tls_cert_path),        "./certs/dev-cert.pem", false, false },
     { "tls.key_path",               "PS_TLS_KEY_PATH",           T_PATH,     FIELD(tls_key_path),         "./certs/dev-key.pem",  false, false },
@@ -348,6 +351,34 @@ bool ps_config_load(ps_config_t *cfg, const char *config_path,
     return ps_config_validate(cfg, err, errlen);
 }
 
+/* True if the comma-separated origin list contains a bare "*" entry
+ * (whitespace around each entry is tolerated, matching the file parser's
+ * own trim behavior elsewhere in this file). */
+static bool cors_origins_contains_wildcard(const char *csv)
+{
+    const char *p = csv;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ',') {
+            p++;
+        }
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+        if (end - start == 1 && *start == '*') {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ps_config_validate(const ps_config_t *cfg, char *err, size_t errlen)
 {
     if (cfg->jwt_secret[0] == '\0') {
@@ -404,6 +435,14 @@ bool ps_config_validate(const ps_config_t *cfg, char *err, size_t errlen)
     if (cfg->max_body_bytes < 1 || cfg->max_header_bytes < 1 ||
         cfg->max_request_line_bytes < 1 || cfg->max_header_count < 1) {
         (void)snprintf(err, errlen, "http limits must all be positive");
+        return false;
+    }
+    if (cfg->cors_allow_credentials &&
+        cors_origins_contains_wildcard(cfg->cors_allowed_origins)) {
+        (void)snprintf(err, errlen,
+                       "cors.allowed_origins contains '*' with cors.allow_credentials=true; "
+                       "refusing to start (plan 7.2a) -- a wildcard origin combined with "
+                       "credentials is a cross-origin credential leak, not merely discouraged");
         return false;
     }
     return true;

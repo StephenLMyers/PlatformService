@@ -12,8 +12,10 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "platform/server.h"
+#include "http/router.h"
+#include "json/json_parse.h"
 #include "platform/tls.h"
+#include "server.h"
 
 static const char *const CERT_PATH = "build/test-scratch-server-cert.pem";
 static const char *const KEY_PATH  = "build/test-scratch-server-key.pem";
@@ -72,29 +74,102 @@ static SSL *client_handshake(int fd, SSL_CTX **out_ctx)
     return cssl;
 }
 
-static bool send_line(SSL *ssl, const char *line)
+static bool send_request(SSL *ssl, const char *method, const char *path)
 {
-    int len = (int)strlen(line);
-    return SSL_write(ssl, line, len) == len;
+    char req[256];
+    int  len = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: test\r\n\r\n", method, path);
+    if (len < 0 || (size_t)len >= sizeof req) {
+        return false;
+    }
+    return SSL_write(ssl, req, len) == len;
 }
 
-static bool recv_line(SSL *ssl, char *buf, size_t buflen)
+typedef struct {
+    int  status;
+    char body[256];
+} test_response_t;
+
+/* Minimal HTTP/1.1 response reader for driving these tests -- see
+ * tests/unit/test_conn.c, which has the same helper for the same reason. */
+static bool recv_response(SSL *ssl, test_response_t *out)
 {
-    size_t n = 0;
-    while (n + 1 < buflen) {
-        char c;
-        int  rc = SSL_read(ssl, &c, 1);
-        if (rc <= 0) {
+    static char buf[4096];
+    size_t       total = 0;
+    out->status  = -1;
+    out->body[0] = '\0';
+
+    for (;;) {
+        int n = SSL_read(ssl, buf + total, (int)(sizeof buf - total - 1));
+        if (n <= 0) {
             return false;
         }
-        buf[n++] = c;
-        if (c == '\n') {
-            break;
+        total += (size_t)n;
+        buf[total] = '\0';
+
+        char *hdrs_end = strstr(buf, "\r\n\r\n");
+        if (hdrs_end == NULL) {
+            continue;
         }
+        size_t header_bytes = (size_t)(hdrs_end + 4 - buf);
+
+        size_t      want_body = 0;
+        const char *cl        = strstr(buf, "Content-Length: ");
+        if (cl != NULL && cl < hdrs_end) {
+            want_body = (size_t)strtoul(cl + strlen("Content-Length: "), NULL, 10);
+        }
+        if (total - header_bytes < want_body) {
+            continue;
+        }
+
+        if (sscanf(buf, "HTTP/1.%*d %d", &out->status) != 1) {
+            return false;
+        }
+        size_t body_len = total - header_bytes;
+        if (body_len >= sizeof out->body) {
+            body_len = sizeof out->body - 1;
+        }
+        memcpy(out->body, buf + header_bytes, body_len);
+        out->body[body_len] = '\0';
+        return true;
     }
-    buf[n] = '\0';
-    return true;
 }
+
+/* Local test router + dispatch, independent of api/routes.c -- see
+ * tests/unit/test_conn.c for the same pattern and its rationale. */
+enum { TEST_ROUTE_ECHO = 1 };
+
+static void build_test_router(ps_router_t *r)
+{
+    char err[256];
+    ps_router_init(r);
+    PS_CHECK(ps_router_add(r, "GET", "/echo", TEST_ROUTE_ECHO, err, sizeof err));
+}
+
+static ps_handler_result_t test_dispatch(int route_id, const ps_http_request_t *req,
+                                         const ps_route_params_t *params, void *app_ctx)
+{
+    (void)req;
+    (void)params;
+    (void)app_ctx;
+
+    ps_handler_result_t result = { .status = 200, .body = NULL, .no_store = false };
+    if (route_id != TEST_ROUTE_ECHO) {
+        result.status = 500;
+        return result;
+    }
+    result.body = ps_json_new_object();
+    if (result.body != NULL) {
+        (void)ps_json_object_set(result.body, "ok", ps_json_new_bool(true));
+    }
+    return result;
+}
+
+static const ps_http_limits_t DEFAULT_HTTP_LIMITS = {
+    .max_request_line_bytes = 8192,
+    .max_header_bytes       = 16384,
+    .max_header_count       = 64,
+    .max_body_bytes         = 1048576,
+};
 
 static double elapsed_seconds(struct timeval start, struct timeval end)
 {
@@ -108,9 +183,12 @@ static void *server_run_thread(void *arg)
     return NULL;
 }
 
-static bool make_server(ps_server_t *server, ps_conn_limits_t limits)
+static bool make_server(ps_server_t *server, ps_conn_limits_t limits, const ps_router_t *router)
 {
     char err[256];
+    server->draining = false;
+    server->cors     = NULL; /* CORS off -- these tests don't exercise it */
+
     if (!ps_listener_open(&server->listener, "127.0.0.1", 0, 16, err, sizeof err)) {
         return false;
     }
@@ -126,6 +204,9 @@ static bool make_server(ps_server_t *server, ps_conn_limits_t limits)
         return false;
     }
     server->conn_limits = limits;
+    server->router      = router;
+    server->dispatch    = test_dispatch;
+    server->app_ctx      = NULL;
     return true;
 }
 
@@ -134,7 +215,7 @@ static bool make_server(ps_server_t *server, ps_conn_limits_t limits)
 typedef struct {
     uint16_t port;
     bool     ok;
-    char     received[64];
+    char     received[256];
 
     /* Signalled once request 1 has round-tripped, so the main thread knows
      * the connection is genuinely already-accepted and in-flight before it
@@ -179,9 +260,9 @@ static void *client_two_round_trips(void *arg)
         return NULL;
     }
 
-    char buf[64];
-    bool ok = send_line(ssl, "one\n") && recv_line(ssl, buf, sizeof buf) &&
-              strcmp(buf, "ps-ack 1\n") == 0;
+    test_response_t resp;
+    bool ok = send_request(ssl, "GET", "/echo") && recv_response(ssl, &resp) &&
+              resp.status == 200;
 
     (void)pthread_mutex_lock(&a->m);
     a->first_ack_received = true;
@@ -189,9 +270,10 @@ static void *client_two_round_trips(void *arg)
     (void)pthread_mutex_unlock(&a->m);
 
     if (ok) {
-        ok = send_line(ssl, "two\n") && recv_line(ssl, buf, sizeof buf);
+        ok = send_request(ssl, "GET", "/echo") && recv_response(ssl, &resp) &&
+             resp.status == 200;
         if (ok) {
-            (void)snprintf(a->received, sizeof a->received, "%s", buf);
+            (void)snprintf(a->received, sizeof a->received, "%s", resp.body);
         }
     }
     a->ok = ok;
@@ -211,10 +293,13 @@ static void *client_two_round_trips(void *arg)
  */
 static void test_in_flight_connection_drains_before_shutdown_returns(void)
 {
-    ps_server_t server;
+    ps_server_t       server;
+    ps_router_t       router;
+    build_test_router(&router);
     ps_conn_limits_t limits = { .read_timeout_s = 5, .write_timeout_s = 5,
-                                .keepalive_max_requests = 5 };
-    PS_CHECK(make_server(&server, limits));
+                                .keepalive_max_requests = 5,
+                                .http_limits = DEFAULT_HTTP_LIMITS };
+    PS_CHECK(make_server(&server, limits, &router));
     uint16_t port = bound_port(server.listener.listen_fd);
 
     pthread_t acceptor;
@@ -242,7 +327,7 @@ static void test_in_flight_connection_drains_before_shutdown_returns(void)
     PS_CHECK(drained);
     PS_CHECK(elapsed_seconds(start, end) < 5.0); /* returned early, not by waiting out the grace period */
     PS_CHECK(carg.ok);
-    PS_CHECK_STR_EQ(carg.received, "ps-ack 2\n");
+    PS_CHECK(strstr(carg.received, "\"ok\":true") != NULL);
 
     /* The listener is really gone: a fresh connection attempt must fail. */
     int fd = connect_loopback(port);
@@ -259,10 +344,13 @@ static void test_in_flight_connection_drains_before_shutdown_returns(void)
  */
 static void test_shutdown_returns_false_when_grace_period_exceeded(void)
 {
-    ps_server_t server;
+    ps_server_t       server;
+    ps_router_t       router;
+    build_test_router(&router);
     ps_conn_limits_t limits = { .read_timeout_s = 30, .write_timeout_s = 30,
-                                .keepalive_max_requests = 5 };
-    PS_CHECK(make_server(&server, limits));
+                                .keepalive_max_requests = 5,
+                                .http_limits = DEFAULT_HTTP_LIMITS };
+    PS_CHECK(make_server(&server, limits, &router));
     uint16_t port = bound_port(server.listener.listen_fd);
 
     pthread_t acceptor;

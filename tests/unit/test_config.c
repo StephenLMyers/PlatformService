@@ -18,6 +18,7 @@ static const char *const ALL_ENV_VARS[] = {
     "PS_MAX_REQUEST_LINE", "PS_MAX_HEADER_BYTES", "PS_MAX_HEADER_COUNT",
     "PS_MAX_BODY_BYTES", "PS_READ_TIMEOUT_S", "PS_WRITE_TIMEOUT_S",
     "PS_KEEPALIVE_IDLE_S", "PS_KEEPALIVE_MAX_REQUESTS",
+    "PS_CORS_ALLOWED_ORIGINS", "PS_CORS_ALLOW_CREDENTIALS",
     "PS_TLS_ENABLED", "PS_TLS_CERT_PATH", "PS_TLS_KEY_PATH",
     "PS_DB_PATH", "PS_DB_BUSY_TIMEOUT_MS",
     "PS_ACCESS_TOKEN_TTL_S", "PS_REFRESH_IDLE_TTL_S",
@@ -380,6 +381,88 @@ static void test_ratelimit_max_entries_zero_fails(void)
     ps_config_free(&cfg);
 }
 
+static void test_cors_defaults_to_disabled(void)
+{
+    clear_env();
+    setenv("PS_JWT_SECRET", VALID_SECRET, 1);
+
+    ps_config_t cfg;
+    char        err[256];
+    bool        ok = ps_config_load(&cfg, NULL, err, sizeof err);
+
+    PS_CHECK(ok);
+    PS_CHECK_STR_EQ(cfg.cors_allowed_origins, "");
+    PS_CHECK(!cfg.cors_allow_credentials);
+
+    ps_config_free(&cfg);
+}
+
+static void test_cors_wildcard_with_credentials_refuses_to_start(void)
+{
+    clear_env();
+    setenv("PS_JWT_SECRET", VALID_SECRET, 1);
+    setenv("PS_CORS_ALLOWED_ORIGINS", "*", 1);
+    setenv("PS_CORS_ALLOW_CREDENTIALS", "true", 1);
+
+    ps_config_t cfg;
+    char        err[256];
+    bool        ok = ps_config_load(&cfg, NULL, err, sizeof err);
+
+    PS_CHECK(!ok);
+    PS_CHECK(strstr(err, "wildcard") != NULL || strstr(err, "'*'") != NULL);
+
+    ps_config_free(&cfg);
+}
+
+static void test_cors_wildcard_among_others_with_credentials_refuses_to_start(void)
+{
+    clear_env();
+    setenv("PS_JWT_SECRET", VALID_SECRET, 1);
+    setenv("PS_CORS_ALLOWED_ORIGINS", "https://good.example, *", 1);
+    setenv("PS_CORS_ALLOW_CREDENTIALS", "true", 1);
+
+    ps_config_t cfg;
+    char        err[256];
+    bool        ok = ps_config_load(&cfg, NULL, err, sizeof err);
+
+    PS_CHECK(!ok);
+
+    ps_config_free(&cfg);
+}
+
+static void test_cors_wildcard_without_credentials_is_fine(void)
+{
+    clear_env();
+    setenv("PS_JWT_SECRET", VALID_SECRET, 1);
+    setenv("PS_CORS_ALLOWED_ORIGINS", "*", 1);
+
+    ps_config_t cfg;
+    char        err[256];
+    bool        ok = ps_config_load(&cfg, NULL, err, sizeof err);
+
+    PS_CHECK(ok);
+    PS_CHECK_STR_EQ(cfg.cors_allowed_origins, "*");
+
+    ps_config_free(&cfg);
+}
+
+static void test_cors_named_origins_with_credentials_is_fine(void)
+{
+    clear_env();
+    setenv("PS_JWT_SECRET", VALID_SECRET, 1);
+    setenv("PS_CORS_ALLOWED_ORIGINS", "https://good.example", 1);
+    setenv("PS_CORS_ALLOW_CREDENTIALS", "true", 1);
+
+    ps_config_t cfg;
+    char        err[256];
+    bool        ok = ps_config_load(&cfg, NULL, err, sizeof err);
+
+    PS_CHECK(ok);
+    PS_CHECK(cfg.cors_allow_credentials);
+
+    ps_config_free(&cfg);
+}
+
 /* OPENSSL_cleanse must actually have run, not been optimised away. */
 static void test_free_zeroes_secret_material(void)
 {
@@ -438,6 +521,11 @@ int main(void)
     PS_RUN_TEST(test_kdf_iterations_below_floor_fails);
     PS_RUN_TEST(test_password_bounds_invalid_fails);
     PS_RUN_TEST(test_ratelimit_max_entries_zero_fails);
+    PS_RUN_TEST(test_cors_defaults_to_disabled);
+    PS_RUN_TEST(test_cors_wildcard_with_credentials_refuses_to_start);
+    PS_RUN_TEST(test_cors_wildcard_among_others_with_credentials_refuses_to_start);
+    PS_RUN_TEST(test_cors_wildcard_without_credentials_is_fine);
+    PS_RUN_TEST(test_cors_named_origins_with_credentials_is_fine);
     PS_RUN_TEST(test_free_zeroes_secret_material);
     PS_RUN_TEST(test_value_too_long_for_field_fails);
 

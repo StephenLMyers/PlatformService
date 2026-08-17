@@ -11,8 +11,12 @@ on:
 # 16's matrix -- phase 2 is the first code in the project with real
 # concurrency (plan 3.3), which is exactly what TSan exists to catch, added
 # deliberately rather than waiting for a race to actually appear. Memory
-# budgets, serial rate-limit tests, and fuzzing land as the code those jobs
-# exercise is written.
+# budgets and serial rate-limit tests land as the code those jobs exercise
+# is written.
+#
+# Phase 3 adds fuzz-smoke (plan 8.6): libFuzzer needs Clang, which every
+# other job deliberately does not install (see plan 16.2) -- only this job
+# does, scoped to itself.
 jobs:
   build:
     name: Build and check
@@ -45,17 +49,18 @@ jobs:
       - name: Generate dev cert
         run: make dev-cert
 
-      - name: Starts, serves a TLS connection, and shuts down cleanly on SIGTERM
+      - name: Starts, serves /healthz over TLS, and shuts down cleanly on SIGTERM
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
         run: |
           ./build/platformservice > run.log 2>&1 &
           pid=$!
           sleep 1
-          printf 'one\ntwo\n' | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null \
+          printf 'GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+            | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null \
             | tee client.log
-          grep -q "ps-ack 1" client.log
-          grep -q "ps-ack 2" client.log
+          grep -q "200 OK" client.log
+          grep -q '"status":"ok"' client.log
           kill -TERM $pid
           wait $pid
           rc=$?
@@ -84,14 +89,18 @@ jobs:
       - name: Generate dev cert
         run: make dev-cert
 
-      - name: Starts, serves a TLS connection, and shuts down cleanly under ASan/UBSan
+      - name: Starts, serves /healthz over TLS, and shuts down cleanly under ASan/UBSan
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
         run: |
           ./build/platformservice > run.log 2>&1 &
           pid=$!
           sleep 1
-          printf 'one\ntwo\n' | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null
+          printf 'GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+            | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null \
+            | tee client.log
+          grep -q "200 OK" client.log
+          grep -q '"status":"ok"' client.log
           kill -TERM $pid
           wait $pid
           rc=$?
@@ -121,6 +130,41 @@ jobs:
         run: |
           make SANFLAGS="-fsanitize=thread"
           make test SANFLAGS="-fsanitize=thread"
+
+  fuzz-smoke:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Clang only here (plan 8.6, 16.2) -- libFuzzer is an LLVM feature GCC
+      # doesn't implement. No other job installs it, and local dev never
+      # needs it either; `make fuzz`/`make fuzz-smoke` simply aren't part of
+      # the GCC-only base toolchain.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libssl-dev libsqlite3-dev pkg-config
+
+      - name: Build and run fuzz targets (60s each, tracked corpus)
+        run: make fuzz-smoke
+
+  harness:
+    name: Python harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config python3-venv
+
+      # make harness builds the real binary itself and creates its own venv;
+      # no PS_JWT_SECRET here -- conftest.py generates a fresh one per
+      # launched instance (tests/harness/conftest.py:base_env).
+      - name: Run black-box pytest suite (plan 8.1) and memory baselines (plan 8.5)
+        run: make harness
 
   memcheck:
     name: Valgrind
@@ -152,9 +196,9 @@ jobs:
       - name: Generate dev cert
         run: make dev-cert
 
-      # Same check, but over the real listener/TLS/thread-pool/shutdown path
-      # now that phase 2 has one -- --check-config alone never touches it.
-      - name: Leak check (listen, serve, shut down)
+      # Same check, but over the real listener/TLS/thread-pool/HTTP/shutdown
+      # path now that phase 3 has one -- --check-config alone never touches it.
+      - name: Leak check (listen, serve /healthz, shut down)
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
         run: |
@@ -166,7 +210,11 @@ jobs:
                    ./build/platformservice &
           pid=$!
           sleep 2
-          printf 'one\ntwo\n' | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null
+          printf 'GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+            | timeout 3 openssl s_client -connect 127.0.0.1:8443 -quiet -verify_quiet 2>/dev/null \
+            | tee client.log
+          grep -q "200 OK" client.log
+          grep -q '"status":"ok"' client.log
           kill -TERM $pid
           wait $pid
           rc=$?

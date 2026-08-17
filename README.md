@@ -93,6 +93,7 @@ export PS_JWT_SECRET="$(openssl rand -base64 48)"
 ## Development
 
 ```bash
+make test           # build and run the C unit tests (tests/unit/)
 make check-banned   # fail on unbounded string functions (strcpy, sprintf, ...)
 make memcheck       # valgrind, gating on definite and indirect leaks
 make dev-cert       # self-signed certificate; key written mode 0600
@@ -101,6 +102,52 @@ make dev-cert       # self-signed certificate; key written mode 0600
 The build uses `-std=c99 -Wall -Wextra -Werror` plus `-Wshadow`,
 `-Wcast-qual`, `-Wmissing-prototypes` and others. This codebase does not
 accumulate warning debt.
+
+Sanitizer builds (ASan/UBSan, ThreadSanitizer) are opt-in via `SANFLAGS`:
+
+```bash
+make clean && make test SANFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+make clean && make test SANFLAGS="-fsanitize=thread"
+```
+
+Always `make clean` first when switching `SANFLAGS` — object files are
+cached by path, not by flag set, and linking objects built with different
+sanitizers together fails with confusing linker errors rather than a clear
+message.
+
+### Fuzzing
+
+```bash
+make fuzz         # build the libFuzzer targets
+make fuzz-smoke   # run each for 60s against the tracked corpus
+```
+
+**Requires Clang** — libFuzzer (`-fsanitize=fuzzer`) is an LLVM feature GCC
+does not implement, so these two targets use Clang directly regardless of
+`CC`. Nothing else in this project needs Clang: every other build, test, and
+CI job is GCC-only, matching the confirmed dev toolchain. In practice this
+makes fuzzing CI-only — the `fuzz-smoke` GitHub Actions job installs Clang
+for itself; without Clang on `PATH`, `make fuzz` simply won't build here.
+
+### Python harness
+
+```bash
+make harness   # black-box pytest suite against the real compiled binary
+```
+
+`tests/harness/` builds the real binary, launches it as a subprocess with an
+ephemeral port and a throwaway self-signed dev cert, and drives it entirely
+over real TLS — `httpx` is pinned to that cert (`verify=<path>`), never
+`verify=False`, so certificate validation stays real. `make harness` creates
+its own venv under `tests/harness/.venv/` on first run from
+`tests/harness/requirements.txt`.
+
+`tests/harness/test_memory.py` is the §8.5 memory-footprint suite: it
+samples the running process's `VmRSS`/`VmHWM` via `tools/memprobe.py`
+(reads `/proc/<pid>/status` directly — `psutil` has no peak-RSS accessor on
+Linux) at idle, under concurrent connections, after a burst of sequential
+requests, and across repeated connect/disconnect cycles, gating on the
+budgets recorded in `plans/00-project-plan.md` §8.5.
 
 ## Layout
 

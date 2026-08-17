@@ -1,11 +1,14 @@
 /*
  * PlatformService -- entry point.
  *
- * Phase 2 scope: start up, load and validate configuration, install signal
- * handling, open a TLS listener, dispatch accepted connections to a worker
- * pool, and shut down gracefully within a bounded grace period (plan 7.2a).
- * Request handling is still a placeholder line protocol (see platform/conn.h);
- * real HTTP/1.1 parsing and routing arrive in phase 3.
+ * Phase 3 scope: start up, load and validate configuration, install signal
+ * handling, open a TLS listener, register the real route table, dispatch
+ * accepted connections to a worker pool that actually parses/routes/
+ * responds to HTTP requests, and shut down gracefully within a bounded
+ * grace period (plan 7.2a). main.c is the one place allowed to depend on
+ * every layer (platform, http/json, api) -- it's the composition root that
+ * wires api/routes.c's concrete handlers into http/conn.c's generic
+ * dispatch callback, so neither has to depend on the other directly.
  */
 #include <errno.h>
 #include <pthread.h>
@@ -16,12 +19,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "api/routes.h"
 #include "platform/config.h"
 #include "platform/log.h"
-#include "platform/server.h"
 #include "platform/tls.h"
+#include "server.h"
 
-#define PS_VERSION "0.2.0-phase2"
+#define PS_VERSION "0.3.0-phase3"
 
 typedef struct {
     const char *config_path;
@@ -209,7 +213,28 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    ps_router_t router;
+    if (!ps_routes_register(&router, err, sizeof err)) {
+        PS_ERROR("failed to register routes: %s", err);
+        goto cleanup;
+    }
+
+    /* Wildcard-origin-plus-credentials is already refused at config load
+     * (platform/config.c); this call also catches other misconfiguration
+     * (e.g. too many origins) before any connection can ever be served.
+     * Mutates cfg.cors_allowed_origins in place (plan http/cors.h) -- safe
+     * here since nothing reads it as a CSV string again afterward. */
+    ps_cors_policy_t cors_policy;
+    if (!ps_cors_policy_init(&cors_policy, cfg.cors_allowed_origins,
+                             cfg.cors_allow_credentials, err, sizeof err)) {
+        PS_ERROR("invalid CORS configuration: %s", err);
+        goto cleanup;
+    }
+
     ps_server_t server;
+    server.draining = false;
+    server.cors     = &cors_policy;
+
     if (!ps_listener_open(&server.listener, cfg.bind_address, cfg.port,
                           cfg.accept_queue_depth, err, sizeof err)) {
         PS_ERROR("failed to open listener: %s", err);
@@ -238,6 +263,15 @@ int main(int argc, char **argv)
     server.conn_limits.read_timeout_s         = cfg.read_timeout_s;
     server.conn_limits.write_timeout_s        = cfg.write_timeout_s;
     server.conn_limits.keepalive_max_requests = cfg.keepalive_max_requests;
+    server.conn_limits.http_limits.max_request_line_bytes = cfg.max_request_line_bytes;
+    server.conn_limits.http_limits.max_header_bytes       = cfg.max_header_bytes;
+    server.conn_limits.http_limits.max_header_count       = cfg.max_header_count;
+    server.conn_limits.http_limits.max_body_bytes         = cfg.max_body_bytes;
+
+    ps_app_ctx_t app_ctx = { .draining = &server.draining };
+    server.router   = &router;
+    server.dispatch = ps_routes_dispatch;
+    server.app_ctx  = &app_ctx;
 
     pthread_t acceptor_thread;
     int       prc = pthread_create(&acceptor_thread, NULL, acceptor_thread_fn, &server);

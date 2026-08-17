@@ -3,7 +3,32 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v1.6
+**Revision:** v1.8
+
+### Changes in v1.8 — phase 3 memory baselines calibrated
+- **§8.5 budgets calibrated against real measurements**, captured via `tools/memprobe.py` and
+  `tests/harness/test_memory.py` running against the actual compiled binary (dev machine: 8 cores).
+  Every budget has comfortable headroom; none needed adjusting from the v1.0 initial targets. See the
+  updated §8.5 table for the real numbers alongside each budget.
+- **§8.5 tests 1, 2, 3 (adapted), and 8 are implemented now**; tests 4-7 need the batch-listing
+  endpoint, the KDF/registration path, and JWTs, none of which exist before phases 5-7, and are
+  deferred until those land. Test 3 substitutes repeated `/healthz` calls for the plan's "10,000
+  authenticated requests," since login doesn't exist yet — it will be tightened to the real
+  authenticated path once phase 7 lands.
+- **Python pytest harness scaffold added** (`tests/harness/conftest.py`, `client.py`,
+  `test_healthz.py`, `test_readyz.py`, `test_memory.py`), matching §8.1's shape: builds the real
+  binary, launches it as a subprocess with an ephemeral port and a throwaway dev-CA-pinned cert (never
+  `verify=False`, per §15.4), and exercises it black-box over real TLS. `make harness` runs it in a
+  pinned venv (`tests/harness/requirements.txt`).
+
+### Changes in v1.7 — fuzzing toolchain correction
+- **§8.6 Fuzzing is CI-only, and requires Clang** — libFuzzer (`-fsanitize=fuzzer`) is an LLVM/Clang
+  feature; GCC rejects the flag outright. The confirmed dev toolchain (§2) is GCC only, with no Clang
+  anywhere in it — a gap in v1.6, discovered when phase 3 actually tried to build the fuzz targets.
+  Rather than add Clang to local dev setup, the fuzz jobs install Clang for themselves in CI
+  (`fuzz-smoke`/`fuzz-long`, §16.1) and nowhere else; `make fuzz`/`make fuzz-smoke` accordingly require
+  Clang on whatever machine runs them, which is never assumed to be the dev machine. See §16.2 for the
+  full reasoning.
 
 ### Changes in v1.6 — gap-closing pass
 - **`POST /v1/auth/password`** (§4.7) — password change requiring re-authentication; also the only way
@@ -162,6 +187,11 @@ Verified by compiling and running a program linking both libraries under
 succeeds, SQLite opens an in-memory database, and **`sizeof(long)=8`** — confirming LP64 and D7's
 premise. Valgrind reported **0 definite, 0 indirect, 0 possibly lost** (56 bytes still reachable from
 OpenSSL init), `ERROR SUMMARY: 0 errors`.
+
+**Clang is deliberately not part of this list (v1.7).** GCC is the only compiler the dev toolchain
+ever needs. The one exception is fuzzing (§8.6): libFuzzer is an LLVM/Clang feature GCC does not
+implement, and fuzzing runs CI-only for exactly that reason — whichever machine runs `make fuzz`
+needs Clang, but that machine is never assumed to be this one.
 
 Full reproducible instructions: **`plans/01-setup-and-prerequisites.md`**.
 
@@ -1531,43 +1561,51 @@ D2 being Linux-only is what makes this practical: `/proc/<pid>/status` gives exa
 recording `VmRSS` (current resident), `VmHWM` (peak resident since start), and heap size. Samples are
 taken at defined points rather than continuously, so results are reproducible.
 
-**Budgets** *(initial targets — to be calibrated against the first real measurements in phase 3 and
-then frozen as regression gates)*:
+**Budgets** *(v1.0 initial targets; calibrated against real measurements in phase 3 — v1.8 — and now
+frozen as regression gates. "Measured" is a single dev-machine run, 8 cores, no DB open yet — schema
+lands in phase 5, so "DB open" is not yet part of the idle scenario; that column will be re-measured
+once it is)*:
 
-| Scenario | Metric | Budget |
-|---|---|---|
-| Idle, post-startup, DB open | `VmRSS` | ≤ 16 MB |
-| Per established TLS connection | marginal `VmRSS` | ≤ 256 KB |
-| 100 concurrent idle connections | `VmRSS` | ≤ 48 MB |
-| Peak during a 1000-row batch response | `VmHWM` delta | ≤ 8 MB |
-| After 10,000 sequential requests, back to idle | `VmRSS` vs. baseline | ≤ +2 MB |
-| Sustained registration load (KDF path) | `VmRSS` | bounded, no monotonic growth |
+| Scenario | Metric | Budget | Measured (v1.8) |
+|---|---|---|---|
+| Idle, post-startup | `VmRSS` | ≤ 16 MB | 8.9 MB |
+| Per established TLS connection | marginal `VmRSS` | ≤ 256 KB | 103 KB |
+| 100 concurrent idle connections | `VmRSS` | ≤ 48 MB | 20.0 MB |
+| Peak during a 1000-row batch response | `VmHWM` delta | ≤ 8 MB | *deferred — no batch endpoint until phase 8* |
+| After 10,000 sequential requests, back to idle | `VmRSS` vs. baseline | ≤ +2 MB | +0.90 MB *(against `/healthz`; re-measure against an authenticated path once phase 7 lands)* |
+| Sustained registration load (KDF path) | `VmRSS` | bounded, no monotonic growth | *deferred — no registration endpoint until phase 6* |
+| 1000 connect/TLS-handshake/disconnect cycles | `VmRSS` vs. baseline | ≤ +2 MB *(v1.8, added to match test 8 below)* | +0.91 MB |
 
 **Tests**
 
-1. **Idle baseline** — start, settle, sample. Regression gate on startup footprint.
-2. **Per-connection cost** — sample at 0, 10, 50, 100 open TLS connections; assert the marginal cost
-   per connection stays within budget and is roughly linear. Catches per-connection buffers that are
-   larger than intended.
-3. **Leak canary** — 10,000 sequential authenticated requests, then let connections close and settle.
-   RSS must return to within +2 MB of baseline. A steady climb across the run is the classic signature
-   of a per-request allocation that is never freed, and this is the single highest-value memory test
-   in the suite.
-4. **Batch-response peak** — the 1000-row admin listing is the largest single response the service
-   produces (~60–80 KB of JSON). Sample `VmHWM` before and after. This measures whether the serializer
-   builds the response in one growing buffer or streams it, and asserts that a large page does not
-   cause a disproportionate spike.
-5. **Batch scaling** — compare peak for `limit=10` against `limit=1000`. Growth must be roughly linear
-   in row count, not quadratic; quadratic indicates repeated buffer reallocation without amortized
-   growth.
-6. **KDF-path memory under load** — sustained concurrent registrations while the semaphore (§7.7)
-   sheds excess with `503`. Asserts rejected requests are *rejected*, not *queued*: memory must stay
-   flat, confirming the DoS mitigation does not convert a CPU problem into a memory problem.
-7. **Error-path leaks** — malformed JSON, oversized bodies, bad tokens, and failed registrations in a
-   loop. Error paths are where `goto cleanup` discipline breaks down and are consistently the
-   least-tested allocation paths in C services.
-8. **Connection-churn** — 1000 connect/TLS-handshake/disconnect cycles. `SSL` object leaks are a
-   common and expensive failure that steady-state request tests miss entirely.
+1. **Idle baseline** *(implemented, phase 3)* — start, settle, sample. Regression gate on startup
+   footprint.
+2. **Per-connection cost** *(implemented, phase 3)* — sample at 0, 10, 50, 100 open TLS connections;
+   assert the marginal cost per connection stays within budget and is roughly linear. Catches
+   per-connection buffers that are larger than intended.
+3. **Leak canary** *(implemented, phase 3, adapted)* — the plan's original shape is 10,000 sequential
+   **authenticated** requests; login doesn't exist until phase 7, so phase 3 runs this against
+   `/healthz` instead and it will be tightened to the real authenticated path once phase 7 lands. Then
+   let connections close and settle. RSS must return to within +2 MB of baseline. A steady climb across
+   the run is the classic signature of a per-request allocation that is never freed, and this is the
+   single highest-value memory test in the suite.
+4. **Batch-response peak** *(deferred to phase 8 — needs the admin listing endpoint)* — the 1000-row
+   admin listing is the largest single response the service produces (~60–80 KB of JSON). Sample
+   `VmHWM` before and after. This measures whether the serializer builds the response in one growing
+   buffer or streams it, and asserts that a large page does not cause a disproportionate spike.
+5. **Batch scaling** *(deferred to phase 8 — needs the admin listing endpoint)* — compare peak for
+   `limit=10` against `limit=1000`. Growth must be roughly linear in row count, not quadratic;
+   quadratic indicates repeated buffer reallocation without amortized growth.
+6. **KDF-path memory under load** *(deferred to phase 6 — needs registration)* — sustained concurrent
+   registrations while the semaphore (§7.7) sheds excess with `503`. Asserts rejected requests are
+   *rejected*, not *queued*: memory must stay flat, confirming the DoS mitigation does not convert a
+   CPU problem into a memory problem.
+7. **Error-path leaks** *(deferred to phase 6/7 — needs registration and token endpoints)* —
+   malformed JSON, oversized bodies, bad tokens, and failed registrations in a loop. Error paths are
+   where `goto cleanup` discipline breaks down and are consistently the least-tested allocation paths
+   in C services.
+8. **Connection-churn** *(implemented, phase 3)* — 1000 connect/TLS-handshake/disconnect cycles. `SSL`
+   object leaks are a common and expensive failure that steady-state request tests miss entirely.
 
 **Tooling beyond the pytest suite**
 
@@ -1604,6 +1642,18 @@ the gap.
 
 This is the single highest-value security investment available for this codebase — cheaper than a
 code audit, and it does not get bored.
+
+**CI-only, by necessity (v1.7).** libFuzzer requires Clang, and the confirmed dev toolchain (§2) is
+GCC only — `-fsanitize=fuzzer` is simply not a flag GCC understands. Rather than add a second compiler
+to local dev setup for one feature, the `fuzz-smoke`/`fuzz-long` CI jobs install Clang for themselves,
+scoped to those jobs only; every other job (build, sanitizers, memory, valgrind) stays GCC, matching
+the dev machine exactly. The practical consequence: `make fuzz` and `make fuzz-smoke` need Clang on
+PATH to build at all, `tests/fuzz/` targets are Clang-only translation units (built with their own
+sanitizer flags, isolated from the main `build/` tree the same way `SANFLAGS` already is — see the
+Makefile), and a contributor without Clang installed simply doesn't run them locally, the same way
+nobody runs the Python harness without a venv. Corpus regressions committed under
+`tests/fuzz/corpus/regressions/` (from a crash CI found) are still just C unit-test-shaped inputs
+once captured, so replaying one manually never requires Clang.
 
 ### 8.7 Tooling
 - `tools/seed_users.py` — generate N users with deterministic, reproducible data, writing rows
@@ -1942,7 +1992,8 @@ The harness is well suited to CI by construction. Two earlier decisions do the w
 
 Everything required is present on a stock runner — `build-essential`, `libssl-dev`, `libsqlite3-dev`,
 `valgrind`, the `openssl` CLI for `make dev-cert`, Python 3.11+, and `/proc/<pid>/status` for the
-§8.5 sampler.
+§8.5 sampler. The two `fuzz-*` jobs additionally install **Clang** (v1.7) — nothing else does, and
+`ubuntu-latest` carries it via one `apt-get install clang` line, not a custom image.
 
 ### 16.1 Job matrix
 
@@ -1953,10 +2004,13 @@ Everything required is present on a stock runner — `build-essential`, `libssl-
 | `memory` | `-O2`, no sanitizers | §8.5, ratio assertions gated | every push/PR |
 | `rate-limits` | `-O2` | Throttle tests, **serial**, production limits | every push/PR |
 | `valgrind` | `-O2 -g` | memcheck over a scripted full-API exercise | `main` + nightly |
-| `fuzz-smoke` | `-fsanitize=fuzzer,address,undefined` | 60s per target from the committed corpus | every push/PR |
-| `fuzz-long` | same | 30 min per target; new crashes filed and corpus updated | nightly |
+| `fuzz-smoke` | Clang, `-fsanitize=fuzzer,address,undefined` | 60s per target from the committed corpus | every push/PR |
+| `fuzz-long` | Clang, same | 30 min per target; new crashes filed and corpus updated | nightly |
 
-### 16.2 Two things that fail on the first run if unaddressed
+Every job above `fuzz-*` builds with GCC, matching the dev machine exactly (§2). Only `fuzz-smoke` and
+`fuzz-long` touch Clang, and only because libFuzzer leaves them no choice (§8.6, §16.2).
+
+### 16.2 Three things that fail on the first run if unaddressed
 
 **Rate limiting versus parallel tests.** Every `xdist` worker connects from `127.0.0.1`, and a per-IP
 limiter cannot distinguish four workers from one attacker. Login and registration throttles trip
@@ -1972,6 +2026,18 @@ ASan build yields numbers that mean nothing.
 
 > Resolution: two jobs, two builds. `sanitizers` proves correctness; `memory` measures footprint.
 > Neither attempts the other's job.
+
+**libFuzzer needs Clang; the confirmed dev toolchain is GCC only (v1.7).** `-fsanitize=fuzzer` is an
+LLVM feature GCC has no equivalent for — it isn't a missing package, GCC simply doesn't implement it.
+Discovered when phase 3 tried to build the fuzz targets on the GCC-only dev machine and the compiler
+rejected the flag outright.
+
+> Resolution: fuzzing stays CI-only. `fuzz-smoke` and `fuzz-long` install Clang for themselves and use
+> it only for the three fuzz targets (`tests/fuzz/`), built into their own object directory so they
+> never mix with the GCC-built `build/` tree. Every other job, and all of local dev, stays GCC-only —
+> adding Clang to the base dev setup for one feature was rejected as more toolchain surface than the
+> benefit justified, given the fuzz jobs can get it for free in CI. The tradeoff: a contributor without
+> Clang installed cannot run `make fuzz` locally, only in CI, or after installing Clang themselves.
 
 ### 16.3 Portable versus absolute assertions
 

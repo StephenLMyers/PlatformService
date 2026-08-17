@@ -12,7 +12,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "platform/conn.h"
+#include "http/conn.h"
+#include "http/router.h"
+#include "json/json_parse.h"
 #include "platform/net.h"
 #include "platform/tls.h"
 
@@ -73,39 +75,127 @@ static SSL *client_handshake(int fd, SSL_CTX **out_ctx)
     return cssl;
 }
 
-static bool send_line(SSL *ssl, const char *line)
+static bool send_request(SSL *ssl, const char *method, const char *path, const char *extra_headers)
 {
-    int len = (int)strlen(line);
-    return SSL_write(ssl, line, len) == len;
+    char req[512];
+    int  len = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: test\r\n%s\r\n",
+                        method, path, extra_headers != NULL ? extra_headers : "");
+    if (len < 0 || (size_t)len >= sizeof req) {
+        return false;
+    }
+    return SSL_write(ssl, req, len) == len;
 }
 
-static bool recv_line(SSL *ssl, char *buf, size_t buflen)
+typedef struct {
+    int  status;
+    char headers[1024]; /* raw header block, for tests that check specific header lines */
+    char body[512];
+} test_response_t;
+
+/* Minimal HTTP/1.1 response reader for driving these tests -- not a real
+ * client, just enough to know the status code and when a response is
+ * fully received (headers, then exactly Content-Length body bytes). */
+static bool recv_response(SSL *ssl, test_response_t *out)
 {
-    size_t n = 0;
-    while (n + 1 < buflen) {
-        char c;
-        int  rc = SSL_read(ssl, &c, 1);
-        if (rc <= 0) {
+    static char buf[4096];
+    size_t       total = 0;
+    out->status     = -1;
+    out->headers[0] = '\0';
+    out->body[0]    = '\0';
+
+    for (;;) {
+        int n = SSL_read(ssl, buf + total, (int)(sizeof buf - total - 1));
+        if (n <= 0) {
             return false;
         }
-        buf[n++] = c;
-        if (c == '\n') {
-            break;
+        total += (size_t)n;
+        buf[total] = '\0';
+
+        char *hdrs_end = strstr(buf, "\r\n\r\n");
+        if (hdrs_end == NULL) {
+            continue;
         }
+        size_t header_bytes = (size_t)(hdrs_end + 4 - buf);
+
+        size_t      want_body = 0;
+        const char *cl        = strstr(buf, "Content-Length: ");
+        if (cl != NULL && cl < hdrs_end) {
+            want_body = (size_t)strtoul(cl + strlen("Content-Length: "), NULL, 10);
+        }
+
+        if (total - header_bytes < want_body) {
+            continue;
+        }
+
+        if (sscanf(buf, "HTTP/1.%*d %d", &out->status) != 1) {
+            return false;
+        }
+        size_t hdr_len = header_bytes;
+        if (hdr_len >= sizeof out->headers) {
+            hdr_len = sizeof out->headers - 1;
+        }
+        memcpy(out->headers, buf, hdr_len);
+        out->headers[hdr_len] = '\0';
+        size_t body_len = total - header_bytes;
+        if (body_len >= sizeof out->body) {
+            body_len = sizeof out->body - 1;
+        }
+        memcpy(out->body, buf + header_bytes, body_len);
+        out->body[body_len] = '\0';
+        return true;
     }
-    buf[n] = '\0';
-    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* A tiny local router + dispatch, independent of api/routes.c -- conn.c's
+ * own tests shouldn't depend on the real business routes. */
+
+enum { TEST_ROUTE_ECHO = 1 };
+
+static void build_test_router(ps_router_t *r)
+{
+    char err[256];
+    ps_router_init(r);
+    PS_CHECK(ps_router_add(r, "GET", "/echo", TEST_ROUTE_ECHO, err, sizeof err));
+}
+
+static ps_handler_result_t test_dispatch(int route_id, const ps_http_request_t *req,
+                                         const ps_route_params_t *params, void *app_ctx)
+{
+    (void)req;
+    (void)params;
+    (void)app_ctx;
+
+    ps_handler_result_t result = { .status = 200, .body = NULL, .no_store = false };
+    if (route_id != TEST_ROUTE_ECHO) {
+        result.status = 500;
+        return result;
+    }
+    result.body = ps_json_new_object();
+    if (result.body != NULL) {
+        (void)ps_json_object_set(result.body, "ok", ps_json_new_bool(true));
+    }
+    return result;
 }
 
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
-    ps_listener_t          *l;
-    SSL_CTX                 *tls_ctx;
-    ps_conn_limits_t         limits;
-    ps_conn_close_reason_t   reason;
-    int                      served;
+    ps_listener_t            *l;
+    SSL_CTX                   *tls_ctx;
+    ps_conn_limits_t           limits;
+    const ps_router_t         *router;
+    const ps_cors_policy_t    *cors; /* NULL = CORS off, the default for most tests here */
+    ps_conn_close_reason_t     reason;
+    int                        served;
 } server_arg_t;
+
+static const ps_http_limits_t DEFAULT_HTTP_LIMITS = {
+    .max_request_line_bytes = 8192,
+    .max_header_bytes       = 16384,
+    .max_header_count       = 64,
+    .max_body_bytes         = 1048576,
+};
 
 static void *server_thread_fn(void *arg)
 {
@@ -121,11 +211,12 @@ static void *server_thread_fn(void *arg)
         return NULL;
     }
 
-    a->reason = ps_conn_handle(client_fd, a->tls_ctx, &a->limits, &a->served);
+    a->reason = ps_conn_handle(client_fd, a->tls_ctx, &a->limits, a->router,
+                               test_dispatch, NULL, a->cors, &a->served);
     return NULL;
 }
 
-/* The plan's own phase-2 exit criterion, proven directly: two requests
+/* The plan's own phase-2/3 exit criterion, proven directly: two requests
  * served over a single TLS connection, the client then disconnecting. */
 static void test_two_requests_on_one_connection(void)
 {
@@ -137,9 +228,13 @@ static void test_two_requests_on_one_connection(void)
     SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
     PS_CHECK(tls_ctx != NULL);
 
+    ps_router_t router;
+    build_test_router(&router);
+
     server_arg_t sarg = {
-        .l = &l, .tls_ctx = tls_ctx,
-        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5 },
+        .l = &l, .tls_ctx = tls_ctx, .router = &router,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
         .reason = PS_CONN_CLOSED_ERROR, .served = -1,
     };
     pthread_t t;
@@ -152,14 +247,15 @@ static void test_two_requests_on_one_connection(void)
     PS_CHECK(cssl != NULL);
 
     if (cssl != NULL) {
-        char buf[64];
-        PS_CHECK(send_line(cssl, "request one\n"));
-        PS_CHECK(recv_line(cssl, buf, sizeof buf));
-        PS_CHECK_STR_EQ(buf, "ps-ack 1\n");
+        test_response_t resp;
 
-        PS_CHECK(send_line(cssl, "request two\n"));
-        PS_CHECK(recv_line(cssl, buf, sizeof buf));
-        PS_CHECK_STR_EQ(buf, "ps-ack 2\n");
+        PS_CHECK(send_request(cssl, "GET", "/echo", NULL));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 200);
+
+        PS_CHECK(send_request(cssl, "GET", "/echo", NULL));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 200);
 
         (void)SSL_shutdown(cssl);
         SSL_free(cssl);
@@ -185,9 +281,13 @@ static void test_connection_closes_after_max_requests(void)
     SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
     PS_CHECK(tls_ctx != NULL);
 
+    ps_router_t router;
+    build_test_router(&router);
+
     server_arg_t sarg = {
-        .l = &l, .tls_ctx = tls_ctx,
-        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 3 },
+        .l = &l, .tls_ctx = tls_ctx, .router = &router,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 3,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
         .reason = PS_CONN_CLOSED_ERROR, .served = -1,
     };
     pthread_t t;
@@ -200,14 +300,16 @@ static void test_connection_closes_after_max_requests(void)
     PS_CHECK(cssl != NULL);
 
     if (cssl != NULL) {
-        char buf[64];
-        for (int i = 1; i <= 3; i++) {
-            PS_CHECK(send_line(cssl, "req\n"));
-            PS_CHECK(recv_line(cssl, buf, sizeof buf));
+        test_response_t resp;
+        for (int i = 0; i < 3; i++) {
+            PS_CHECK(send_request(cssl, "GET", "/echo", NULL));
+            PS_CHECK(recv_response(cssl, &resp));
+            PS_CHECK_EQ_INT(resp.status, 200);
         }
         /* Server has hit its cap and torn the connection down; one more
          * read must observe that, one way or another. */
-        int rc = SSL_read(cssl, buf, sizeof buf);
+        char c;
+        int  rc = SSL_read(cssl, &c, 1);
         PS_CHECK(rc <= 0);
 
         SSL_free(cssl);
@@ -223,6 +325,56 @@ static void test_connection_closes_after_max_requests(void)
     ps_listener_close(&l);
 }
 
+/* New in phase 3: an explicit "Connection: close" ends the connection
+ * after one response even though the request cap hasn't been reached. */
+static void test_connection_close_header_ends_connection_early(void)
+{
+    char          err[256];
+    ps_listener_t l;
+    PS_CHECK(ps_listener_open(&l, "127.0.0.1", 0, 16, err, sizeof err));
+    uint16_t port = bound_port(l.listen_fd);
+
+    SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
+    PS_CHECK(tls_ctx != NULL);
+
+    ps_router_t router;
+    build_test_router(&router);
+
+    server_arg_t sarg = {
+        .l = &l, .tls_ctx = tls_ctx, .router = &router,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 10,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
+        .reason = PS_CONN_CLOSED_ERROR, .served = -1,
+    };
+    pthread_t t;
+    PS_CHECK(pthread_create(&t, NULL, server_thread_fn, &sarg) == 0);
+
+    int      fd = connect_loopback(port);
+    PS_CHECK(fd >= 0);
+    SSL_CTX *cctx = NULL;
+    SSL     *cssl = client_handshake(fd, &cctx);
+    PS_CHECK(cssl != NULL);
+
+    if (cssl != NULL) {
+        test_response_t resp;
+        PS_CHECK(send_request(cssl, "GET", "/echo", "Connection: close\r\n"));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 200);
+        PS_CHECK(strstr(resp.body, "\"ok\":true") != NULL);
+
+        SSL_free(cssl);
+        SSL_CTX_free(cctx);
+    }
+    (void)close(fd);
+
+    PS_CHECK(pthread_join(t, NULL) == 0);
+    PS_CHECK_EQ_INT(sarg.served, 1);
+    PS_CHECK_EQ_INT(sarg.reason, PS_CONN_CLOSED_CONNECTION_HEADER);
+
+    ps_tls_ctx_free(tls_ctx);
+    ps_listener_close(&l);
+}
+
 static void test_idle_timeout_closes_connection(void)
 {
     char          err[256];
@@ -233,9 +385,13 @@ static void test_idle_timeout_closes_connection(void)
     SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
     PS_CHECK(tls_ctx != NULL);
 
+    ps_router_t router;
+    build_test_router(&router);
+
     server_arg_t sarg = {
-        .l = &l, .tls_ctx = tls_ctx,
-        .limits = { .read_timeout_s = 1, .write_timeout_s = 1, .keepalive_max_requests = 5 },
+        .l = &l, .tls_ctx = tls_ctx, .router = &router,
+        .limits = { .read_timeout_s = 1, .write_timeout_s = 1, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
         .reason = PS_CONN_CLOSED_ERROR, .served = -1,
     };
     pthread_t t;
@@ -281,9 +437,13 @@ static void test_handshake_failure_still_closes_fd(void)
     SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
     PS_CHECK(tls_ctx != NULL);
 
+    ps_router_t router;
+    build_test_router(&router);
+
     server_arg_t sarg = {
-        .l = &l, .tls_ctx = tls_ctx,
-        .limits = { .read_timeout_s = 2, .write_timeout_s = 2, .keepalive_max_requests = 5 },
+        .l = &l, .tls_ctx = tls_ctx, .router = &router,
+        .limits = { .read_timeout_s = 2, .write_timeout_s = 2, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
         .reason = PS_CONN_CLOSED_MAX_REQUESTS, .served = -1,
     };
     pthread_t t;
@@ -298,6 +458,274 @@ static void test_handshake_failure_still_closes_fd(void)
     PS_CHECK_EQ_INT(sarg.reason, PS_CONN_CLOSED_ERROR);
 
     (void)close(fd);
+    ps_tls_ctx_free(tls_ctx);
+    ps_listener_close(&l);
+}
+
+static void test_unknown_path_returns_404_and_stays_alive(void)
+{
+    char          err[256];
+    ps_listener_t l;
+    PS_CHECK(ps_listener_open(&l, "127.0.0.1", 0, 16, err, sizeof err));
+    uint16_t port = bound_port(l.listen_fd);
+
+    SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
+    PS_CHECK(tls_ctx != NULL);
+
+    ps_router_t router;
+    build_test_router(&router);
+
+    server_arg_t sarg = {
+        .l = &l, .tls_ctx = tls_ctx, .router = &router,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
+        .reason = PS_CONN_CLOSED_ERROR, .served = -1,
+    };
+    pthread_t t;
+    PS_CHECK(pthread_create(&t, NULL, server_thread_fn, &sarg) == 0);
+
+    int      fd = connect_loopback(port);
+    PS_CHECK(fd >= 0);
+    SSL_CTX *cctx = NULL;
+    SSL     *cssl = client_handshake(fd, &cctx);
+    PS_CHECK(cssl != NULL);
+
+    if (cssl != NULL) {
+        test_response_t resp;
+        PS_CHECK(send_request(cssl, "GET", "/nope", NULL));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 404);
+
+        /* A 404 is not a parse error -- the connection stays alive and can
+         * serve a real route right after it. */
+        PS_CHECK(send_request(cssl, "GET", "/echo", NULL));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 200);
+
+        (void)SSL_shutdown(cssl);
+        SSL_free(cssl);
+        SSL_CTX_free(cctx);
+    }
+    (void)close(fd);
+
+    PS_CHECK(pthread_join(t, NULL) == 0);
+    PS_CHECK_EQ_INT(sarg.served, 2);
+
+    ps_tls_ctx_free(tls_ctx);
+    ps_listener_close(&l);
+}
+
+/* ------------------------------------------------------------------------- */
+/* CORS (plan 7.2a) -- exercising the real conn.c wiring, not just cors.c   */
+/* and response.c in isolation.                                              */
+
+static void test_options_returns_405_when_cors_disabled(void)
+{
+    char          err[256];
+    ps_listener_t l;
+    PS_CHECK(ps_listener_open(&l, "127.0.0.1", 0, 16, err, sizeof err));
+    uint16_t port = bound_port(l.listen_fd);
+
+    SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
+    PS_CHECK(tls_ctx != NULL);
+
+    ps_router_t router;
+    build_test_router(&router);
+
+    server_arg_t sarg = {
+        .l = &l, .tls_ctx = tls_ctx, .router = &router, .cors = NULL,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
+        .reason = PS_CONN_CLOSED_ERROR, .served = -1,
+    };
+    pthread_t t;
+    PS_CHECK(pthread_create(&t, NULL, server_thread_fn, &sarg) == 0);
+
+    int      fd = connect_loopback(port);
+    PS_CHECK(fd >= 0);
+    SSL_CTX *cctx = NULL;
+    SSL     *cssl = client_handshake(fd, &cctx);
+    PS_CHECK(cssl != NULL);
+
+    if (cssl != NULL) {
+        test_response_t resp;
+        PS_CHECK(send_request(cssl, "OPTIONS", "/echo", "Origin: https://example.com\r\n"));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 405);
+        PS_CHECK(strstr(resp.headers, "Access-Control-") == NULL);
+
+        (void)SSL_shutdown(cssl);
+        SSL_free(cssl);
+        SSL_CTX_free(cctx);
+    }
+    (void)close(fd);
+
+    PS_CHECK(pthread_join(t, NULL) == 0);
+    ps_tls_ctx_free(tls_ctx);
+    ps_listener_close(&l);
+}
+
+static void test_options_preflight_succeeds_for_allowed_origin(void)
+{
+    char          err[256];
+    ps_listener_t l;
+    PS_CHECK(ps_listener_open(&l, "127.0.0.1", 0, 16, err, sizeof err));
+    uint16_t port = bound_port(l.listen_fd);
+
+    SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
+    PS_CHECK(tls_ctx != NULL);
+
+    ps_router_t router;
+    build_test_router(&router);
+
+    char              origins[] = "https://allowed.example";
+    ps_cors_policy_t  cors;
+    PS_CHECK(ps_cors_policy_init(&cors, origins, false, err, sizeof err));
+
+    server_arg_t sarg = {
+        .l = &l, .tls_ctx = tls_ctx, .router = &router, .cors = &cors,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
+        .reason = PS_CONN_CLOSED_ERROR, .served = -1,
+    };
+    pthread_t t;
+    PS_CHECK(pthread_create(&t, NULL, server_thread_fn, &sarg) == 0);
+
+    int      fd = connect_loopback(port);
+    PS_CHECK(fd >= 0);
+    SSL_CTX *cctx = NULL;
+    SSL     *cssl = client_handshake(fd, &cctx);
+    PS_CHECK(cssl != NULL);
+
+    if (cssl != NULL) {
+        test_response_t resp;
+        PS_CHECK(send_request(cssl, "OPTIONS", "/echo", "Origin: https://allowed.example\r\n"));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 204);
+        PS_CHECK(strstr(resp.headers, "Access-Control-Allow-Origin: https://allowed.example\r\n")
+                 != NULL);
+        PS_CHECK(strstr(resp.headers, "Access-Control-Allow-Methods:") != NULL);
+        PS_CHECK(strstr(resp.headers, "Access-Control-Allow-Headers:") != NULL);
+        PS_CHECK(strstr(resp.headers, "Vary: Origin\r\n") != NULL);
+
+        (void)SSL_shutdown(cssl);
+        SSL_free(cssl);
+        SSL_CTX_free(cctx);
+    }
+    (void)close(fd);
+
+    PS_CHECK(pthread_join(t, NULL) == 0);
+    ps_tls_ctx_free(tls_ctx);
+    ps_listener_close(&l);
+}
+
+static void test_options_preflight_omits_headers_for_disallowed_origin(void)
+{
+    char          err[256];
+    ps_listener_t l;
+    PS_CHECK(ps_listener_open(&l, "127.0.0.1", 0, 16, err, sizeof err));
+    uint16_t port = bound_port(l.listen_fd);
+
+    SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
+    PS_CHECK(tls_ctx != NULL);
+
+    ps_router_t router;
+    build_test_router(&router);
+
+    char              origins[] = "https://allowed.example";
+    ps_cors_policy_t  cors;
+    PS_CHECK(ps_cors_policy_init(&cors, origins, false, err, sizeof err));
+
+    server_arg_t sarg = {
+        .l = &l, .tls_ctx = tls_ctx, .router = &router, .cors = &cors,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
+        .reason = PS_CONN_CLOSED_ERROR, .served = -1,
+    };
+    pthread_t t;
+    PS_CHECK(pthread_create(&t, NULL, server_thread_fn, &sarg) == 0);
+
+    int      fd = connect_loopback(port);
+    PS_CHECK(fd >= 0);
+    SSL_CTX *cctx = NULL;
+    SSL     *cssl = client_handshake(fd, &cctx);
+    PS_CHECK(cssl != NULL);
+
+    if (cssl != NULL) {
+        test_response_t resp;
+        /* CORS is on, but this Origin isn't on the allowlist: the browser
+         * (not this server) is what's supposed to enforce the block, by
+         * never seeing the header it needs -- so this is still 204, just
+         * without any Access-Control-* header, never a 403. Telling a
+         * disallowed origin "you're disallowed" via status code would be
+         * an oracle a same-origin-policy check should never need. */
+        PS_CHECK(send_request(cssl, "OPTIONS", "/echo", "Origin: https://evil.example\r\n"));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 204);
+        PS_CHECK(strstr(resp.headers, "Access-Control-") == NULL);
+
+        (void)SSL_shutdown(cssl);
+        SSL_free(cssl);
+        SSL_CTX_free(cctx);
+    }
+    (void)close(fd);
+
+    PS_CHECK(pthread_join(t, NULL) == 0);
+    ps_tls_ctx_free(tls_ctx);
+    ps_listener_close(&l);
+}
+
+static void test_normal_response_gets_cors_header_when_origin_allowed(void)
+{
+    char          err[256];
+    ps_listener_t l;
+    PS_CHECK(ps_listener_open(&l, "127.0.0.1", 0, 16, err, sizeof err));
+    uint16_t port = bound_port(l.listen_fd);
+
+    SSL_CTX *tls_ctx = ps_tls_ctx_create(CERT_PATH, KEY_PATH, err, sizeof err);
+    PS_CHECK(tls_ctx != NULL);
+
+    ps_router_t router;
+    build_test_router(&router);
+
+    char              origins[] = "https://allowed.example";
+    ps_cors_policy_t  cors;
+    PS_CHECK(ps_cors_policy_init(&cors, origins, true, err, sizeof err));
+
+    server_arg_t sarg = {
+        .l = &l, .tls_ctx = tls_ctx, .router = &router, .cors = &cors,
+        .limits = { .read_timeout_s = 5, .write_timeout_s = 5, .keepalive_max_requests = 5,
+                   .http_limits = DEFAULT_HTTP_LIMITS },
+        .reason = PS_CONN_CLOSED_ERROR, .served = -1,
+    };
+    pthread_t t;
+    PS_CHECK(pthread_create(&t, NULL, server_thread_fn, &sarg) == 0);
+
+    int      fd = connect_loopback(port);
+    PS_CHECK(fd >= 0);
+    SSL_CTX *cctx = NULL;
+    SSL     *cssl = client_handshake(fd, &cctx);
+    PS_CHECK(cssl != NULL);
+
+    if (cssl != NULL) {
+        test_response_t resp;
+        PS_CHECK(send_request(cssl, "GET", "/echo", "Origin: https://allowed.example\r\n"));
+        PS_CHECK(recv_response(cssl, &resp));
+        PS_CHECK_EQ_INT(resp.status, 200);
+        PS_CHECK(strstr(resp.headers, "Access-Control-Allow-Origin: https://allowed.example\r\n")
+                 != NULL);
+        PS_CHECK(strstr(resp.headers, "Access-Control-Allow-Credentials: true\r\n") != NULL);
+        /* Allow-Methods/Allow-Headers are preflight-only; a real response
+         * doesn't need them. */
+        PS_CHECK(strstr(resp.headers, "Access-Control-Allow-Methods:") == NULL);
+
+        (void)SSL_shutdown(cssl);
+        SSL_free(cssl);
+        SSL_CTX_free(cctx);
+    }
+    (void)close(fd);
+
+    PS_CHECK(pthread_join(t, NULL) == 0);
     ps_tls_ctx_free(tls_ctx);
     ps_listener_close(&l);
 }
@@ -317,8 +745,14 @@ int main(void)
 
     PS_RUN_TEST(test_two_requests_on_one_connection);
     PS_RUN_TEST(test_connection_closes_after_max_requests);
+    PS_RUN_TEST(test_connection_close_header_ends_connection_early);
     PS_RUN_TEST(test_idle_timeout_closes_connection);
     PS_RUN_TEST(test_handshake_failure_still_closes_fd);
+    PS_RUN_TEST(test_unknown_path_returns_404_and_stays_alive);
+    PS_RUN_TEST(test_options_returns_405_when_cors_disabled);
+    PS_RUN_TEST(test_options_preflight_succeeds_for_allowed_origin);
+    PS_RUN_TEST(test_options_preflight_omits_headers_for_disallowed_origin);
+    PS_RUN_TEST(test_normal_response_gets_cors_header_when_origin_allowed);
 
     (void)remove(CERT_PATH);
     (void)remove(KEY_PATH);
