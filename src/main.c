@@ -25,6 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "api/rbac.h"
 #include "api/routes.h"
 #include "auth/bootstrap.h"
 #include "auth/password.h"
@@ -44,7 +45,54 @@ typedef struct {
     bool        check_config;
     bool        show_help;
     bool        show_version;
+    bool        dump_routes;
 } ps_args_t;
+
+/*
+ * plan 8.3: "The service exposes its route table under a debug build
+ * flag; the test reads it." Needs neither config nor a running service --
+ * the policy table (api/rbac.c) is static data -- so this follows
+ * --help/--version's "no environment needed at all" shape, not
+ * --check-config's (which genuinely needs a loaded, validated config).
+ * One tab-separated line per route: method, path pattern, policy kind,
+ * required role ("NONE" when not applicable) -- deliberately plain text,
+ * not JSON, matching ps_config_print's own precedent for debug output
+ * meant to be read by a human or grepped/split by a test, not parsed as a
+ * structured document.
+ */
+static const char *policy_kind_name(ps_policy_kind_t kind)
+{
+    switch (kind) {
+    case PS_POLICY_PUBLIC:        return "PUBLIC";
+    case PS_POLICY_AUTHENTICATED: return "AUTHENTICATED";
+    case PS_POLICY_ROLE:          return "ROLE";
+    case PS_POLICY_SELF_OR_ROLE:  return "SELF_OR_ROLE";
+    }
+    return "UNKNOWN"; /* unreachable: every ps_policy_kind_t is handled above */
+}
+
+static const char *required_role_name(uint32_t role_bit)
+{
+    if (role_bit == 0) {
+        return "NONE";
+    }
+    if (role_bit == PS_JWT_ROLE_ADMIN) {
+        return "ADMIN";
+    }
+    if (role_bit == PS_JWT_ROLE_USER) {
+        return "USER";
+    }
+    return "UNKNOWN";
+}
+
+static void dump_routes(void)
+{
+    for (size_t i = 0; i < PS_RBAC_POLICIES_COUNT; i++) {
+        const ps_route_policy_t *p = &PS_RBAC_POLICIES[i];
+        (void)printf("%s\t%s\t%s\t%s\n", p->method, p->path_pattern,
+                     policy_kind_name(p->kind), required_role_name(p->required_role));
+    }
+}
 
 static void print_usage(const char *argv0)
 {
@@ -59,6 +107,7 @@ static void print_usage(const char *argv0)
         "      --dev           Enable dev mode: relaxed rate limits, verification\n"
         "                      links logged, dev outbox endpoint. Never for production.\n"
         "      --check-config  Load and validate configuration, print it, exit\n"
+        "      --dump-routes   Print the route table and its RBAC policy, exit\n"
         "  -v, --version       Print version and exit\n"
         "  -h, --help          Print this help and exit\n"
         "\n"
@@ -93,6 +142,8 @@ static bool parse_args(int argc, char **argv, ps_args_t *args,
             args->dev_mode = true;
         } else if (strcmp(a, "--check-config") == 0) {
             args->check_config = true;
+        } else if (strcmp(a, "--dump-routes") == 0) {
+            args->dump_routes = true;
         } else if (strcmp(a, "-c") == 0 || strcmp(a, "--config") == 0) {
             if (i + 1 >= argc) {
                 (void)snprintf(err, errlen, "%s requires a path argument", a);
@@ -179,6 +230,11 @@ int main(int argc, char **argv)
     }
     if (args.show_version) {
         (void)printf("%s\n", PS_VERSION);
+        exit_code = EXIT_SUCCESS;
+        goto cleanup;
+    }
+    if (args.dump_routes) {
+        dump_routes();
         exit_code = EXIT_SUCCESS;
         goto cleanup;
     }

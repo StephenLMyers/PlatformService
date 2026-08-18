@@ -27,6 +27,7 @@ enum {
     PS_ROUTE_ID_REFRESH             = 7,
     PS_ROUTE_ID_LOGOUT              = 8,
     PS_ROUTE_ID_PASSWORD_CHANGE     = 9,
+    PS_ROUTE_ID_GET_USER            = 10,
 };
 
 /*

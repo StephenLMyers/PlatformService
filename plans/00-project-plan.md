@@ -3,7 +3,44 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v2.1
+**Revision:** v2.2
+
+### Changes in v2.2 — phase 8 complete: RBAC policy engine, default deny, GET /v1/users/{userId}
+- **New module `api/rbac.c`/`.h`** (not `auth/rbac.c` as plan 3.2's aspirational source tree lists --
+  plan 3.1's architecture diagram places "RBAC policy binding" in `api/`, and the policy table is keyed
+  by `api/routes.h`'s `route_id`, so a lower-layer `auth/` module would need an upward, forbidden
+  dependency on `api/`. See gotchas.md.): the plan 6.5/D10 declarative policy table (`PS_RBAC_POLICIES`)
+  and `ps_rbac_check`, keyed by `route_id` rather than the plan's own illustrative (method,
+  path_pattern) string sketch -- `route_id` already is that identity, assigned once by the router.
+- **`api/routes.c`'s dispatch now enforces RBAC centrally**: looks up the route's policy (`NULL` =
+  default deny, unconditional 401), authenticates once via the now-public
+  `ps_auth_authenticate_bearer` (`api/auth_api.h`, exposed from what was phase 7's private
+  `authenticate_bearer`) for any non-public policy, parses and validates the `userId` path parameter
+  per §7.3 exactly once for `POLICY_SELF_OR_ROLE` routes, then calls `ps_rbac_check` before ever
+  reaching a handler. `ps_auth_handle_logout`/`ps_auth_handle_password_change` (phase 7) now receive
+  already-verified `claims` as a parameter instead of authenticating themselves a second time --
+  a pure internal refactor (see gotchas.md), behavior unchanged, all phase 7 harness tests pass as-is.
+- **New module `api/user_api.c`/`.h`**: `GET /v1/users/{userId}` (§4.8). Two response views, not a
+  conditional field -- email present only when the subject is asking; an admin reading someone else's
+  record gets `userId`/`username` only, the key itself absent, never null. `userId` is emitted as a
+  JSON string, matching `json_parse.h`'s documented service-wide convention, not the bare number in
+  §4.8's own (unmigrated) illustrative example -- see gotchas.md. `ADMIN_USER_READ` audited only when
+  an admin reads a record that isn't their own, never for a self-read by anyone including an admin.
+- **`main.c` gains `--dump-routes`**: prints the route table (method, path pattern, policy kind,
+  required role) as tab-separated lines and exits, needing no environment at all (same shape as
+  `--help`/`--version`, since the policy table is static data) -- this is what plan 8.3's default-deny
+  suite reads to enumerate every registered route without a second, hand-maintained list.
+- **New tests**: `tests/unit/test_rbac.c` (policy table invariants + `ps_rbac_check` truth table,
+  including the D9 case), a traversal-style-path case added to `tests/unit/test_http_router.c` (plan
+  8.4's IDOR case can't be exercised black-box through a real HTTP client -- see gotchas.md),
+  `tests/harness/test_default_deny.py` (plan 8.3), `tests/harness/test_get_user.py` (plan 4.8's full
+  RBAC matrix, the PII disclosure boundary, and the rest of the plan 8.4 IDOR suite: body field, query
+  parameter, and `X-User-Id` header override attempts all ignored). `launch`/`db_query`/
+  `latest_verification_token`, previously duplicated between `test_auth.py` and `test_sessions.py`,
+  moved to `conftest.py` now that a third file needs them.
+- **Coverage** (unit tests + harness combined) moved from 82.4% lines / 99.6% functions / 70.8%
+  branches to 82.6% / 99.6% / 71.1% -- unlike every phase since 6, the percentages themselves rose
+  slightly this time, not just the absolute covered count (+105 lines, +8 functions, +63 branches).
 
 ### Changes in v2.1 — fixed the pre-existing `server->draining` data race flagged in v2.0
 - **`server->draining` (§7.2a step 1) changed from `volatile bool` to a plain `bool` accessed

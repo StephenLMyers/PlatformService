@@ -198,21 +198,9 @@ static ps_json_value_t *token_pair_body(const ps_buf_t *access_token,
     return obj;
 }
 
-/*
- * plan 4.6/4.7's minimal bearer-token authentication: extract, verify, hand
- * back claims. Deliberately not the RBAC policy engine (phase 8's job) --
- * logout and password-change only need "prove who is asking", not
- * role-based gating.
- */
-typedef enum {
-    PS_BEARER_OK = 0,
-    PS_BEARER_MISSING,
-    PS_BEARER_INVALID,
-} ps_bearer_result_t;
-
-static ps_bearer_result_t authenticate_bearer(const ps_http_request_t *req,
-                                              const ps_app_ctx_t *app_ctx, int64_t now,
-                                              ps_jwt_claims_t *out)
+ps_bearer_result_t ps_auth_authenticate_bearer(const ps_http_request_t *req,
+                                               const ps_app_ctx_t *app_ctx, int64_t now,
+                                               ps_jwt_claims_t *out)
 {
     static const char PREFIX[]    = "Bearer ";
     const size_t       PREFIX_LEN = sizeof PREFIX - 1;
@@ -1099,16 +1087,13 @@ ps_handler_result_t ps_auth_handle_refresh(const ps_http_request_t *req,
 
 ps_handler_result_t ps_auth_handle_logout(const ps_http_request_t *req,
                                           const ps_route_params_t *params,
-                                          const char *peer_addr, const ps_app_ctx_t *app_ctx)
+                                          const char *peer_addr,
+                                          const ps_jwt_claims_t *claims,
+                                          const ps_app_ctx_t *app_ctx)
 {
     (void)params;
 
     int64_t now = time(NULL);
-
-    ps_jwt_claims_t claims;
-    if (authenticate_bearer(req, app_ctx, now, &claims) != PS_BEARER_OK) {
-        return error_result(401, "UNAUTHORIZED", "missing or invalid access token");
-    }
 
     char             json_err[128];
     ps_json_value_t *body = ps_json_parse(req->body, req->body_len, json_err, sizeof json_err);
@@ -1154,7 +1139,7 @@ ps_handler_result_t ps_auth_handle_logout(const ps_http_request_t *req,
         ps_db_pool_release(app_ctx->db_pool, conn);
         return internal_error_result();
     }
-    if (family.user_id != claims.user_id) {
+    if (family.user_id != claims->user_id) {
         /* plan 4.6: sub from the access token must match the family's
          * owner, or 403 -- a valid token must never end a session it
          * doesn't own. */
@@ -1204,16 +1189,12 @@ ps_handler_result_t ps_auth_handle_logout(const ps_http_request_t *req,
 ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
                                                     const ps_route_params_t *params,
                                                     const char *peer_addr,
+                                                    const ps_jwt_claims_t *claims,
                                                     const ps_app_ctx_t *app_ctx)
 {
     (void)params;
 
     int64_t now = time(NULL);
-
-    ps_jwt_claims_t claims;
-    if (authenticate_bearer(req, app_ctx, now, &claims) != PS_BEARER_OK) {
-        return error_result(401, "UNAUTHORIZED", "missing or invalid access token");
-    }
 
     char             json_err[128];
     ps_json_value_t *body = ps_json_parse(req->body, req->body_len, json_err, sizeof json_err);
@@ -1254,13 +1235,13 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
 
     sqlite3 *conn = ps_db_pool_acquire(app_ctx->db_pool);
 
-    /* claims.user_id came from a signature-verified token, so the row is
+    /* claims->user_id came from a signature-verified token, so the row is
      * expected to exist -- but re-authentication (plan 4.7) still means
      * checking the *current* password for real, never trusting the token
      * alone, and running the same dummy-hash path if the row is somehow
      * gone so this call's timing doesn't vary either way. */
     ps_user_row_t user;
-    bool          found      = ps_user_store_get_by_id(conn, claims.user_id, &user);
+    bool          found      = ps_user_store_get_by_id(conn, claims->user_id, &user);
     bool          current_ok = false;
     if (found) {
         ps_password_hash_t stored;
@@ -1284,7 +1265,7 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
         memset(&audit_entry, 0, sizeof audit_entry);
         audit_entry.occurred_at        = now;
         audit_entry.has_target_user_id = true;
-        audit_entry.target_user_id     = claims.user_id;
+        audit_entry.target_user_id     = claims->user_id;
         (void)snprintf(audit_entry.event, sizeof audit_entry.event, "PASSWORD_CHANGE");
         (void)snprintf(audit_entry.outcome, sizeof audit_entry.outcome, "FAILURE");
         audit_entry.has_detail = true;
@@ -1301,7 +1282,7 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
     }
 
     unsigned char surviving_family_id[PS_FAMILY_ID_LEN];
-    if (!hex_decode(claims.family_id, PS_JWT_FAMILY_ID_HEX_LEN, surviving_family_id)) {
+    if (!hex_decode(claims->family_id, PS_JWT_FAMILY_ID_HEX_LEN, surviving_family_id)) {
         ps_db_pool_release(app_ctx->db_pool, conn);
         return internal_error_result();
     }
@@ -1314,13 +1295,13 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
     }
 
     char db_err[256];
-    bool ok = ps_user_store_set_password(conn, claims.user_id, new_hash.hash, new_hash.salt,
+    bool ok = ps_user_store_set_password(conn, claims->user_id, new_hash.hash, new_hash.salt,
                                          new_hash.iterations, now, db_err, sizeof db_err);
 
     /* plan 4.7: every other session family dies; the one that issued this
      * very request survives. */
     int revoked_count = 0;
-    ok = ok && ps_session_store_revoke_all_for_user(conn, claims.user_id, surviving_family_id,
+    ok = ok && ps_session_store_revoke_all_for_user(conn, claims->user_id, surviving_family_id,
                                                     "PASSWORD_CHANGE", now, &revoked_count, db_err,
                                                     sizeof db_err);
 
@@ -1328,7 +1309,7 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
     memset(&audit_entry, 0, sizeof audit_entry);
     audit_entry.occurred_at        = now;
     audit_entry.has_target_user_id = true;
-    audit_entry.target_user_id     = claims.user_id;
+    audit_entry.target_user_id     = claims->user_id;
     (void)snprintf(audit_entry.event, sizeof audit_entry.event, "PASSWORD_CHANGE");
     (void)snprintf(audit_entry.outcome, sizeof audit_entry.outcome, ok ? "SUCCESS" : "FAILURE");
     if (ok) {

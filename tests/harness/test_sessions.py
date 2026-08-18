@@ -5,71 +5,10 @@ instance -- login/lockout/reuse-detection all mutate shared per-account
 state (failed_logins, session families) in ways that must not leak between
 tests sharing one instance.
 """
-import contextlib
-import re
-import sqlite3
-import ssl
-import subprocess
-
-import httpx
-
-from conftest import base_env, free_port, generate_dev_cert, stop_and_reap, wait_for_healthz
+from client import make_client
+from conftest import db_query, latest_verification_token, launch
 
 PASSWORD = "correct horse battery staple"
-
-
-@contextlib.contextmanager
-def launch(built_binary, tmp_path_factory, name, env_overrides=None):
-    work_dir = tmp_path_factory.mktemp(name)
-    cert_path, key_path = generate_dev_cert(work_dir)
-    port = free_port()
-    env = base_env(port, cert_path, key_path)
-    env["PS_KDF_ITERATIONS"] = "1000"
-    env["PS_DEV_MODE"] = "true"
-    if env_overrides:
-        env.update(env_overrides)
-
-    log_path = work_dir / "service.log"
-    with open(log_path, "wb") as log_file:
-        proc = subprocess.Popen(
-            [str(built_binary)], env=env, stdout=log_file, stderr=subprocess.STDOUT,
-        )
-    base_url = f"https://127.0.0.1:{port}"
-    wait_for_healthz(base_url, cert_path, proc)
-    try:
-        yield base_url, cert_path, env["PS_DB_PATH"], log_path
-    finally:
-        exit_code = stop_and_reap(proc, log_path)
-        assert exit_code == 0, (
-            f"service exited {exit_code}, expected 0; log:\n"
-            f"{log_path.read_text(errors='replace')}"
-        )
-
-
-def make_client(base_url, cert_path):
-    ctx = ssl.create_default_context(cafile=str(cert_path))
-    return httpx.Client(base_url=base_url, verify=ctx, timeout=5.0)
-
-
-def db_query(db_path: str, sql: str, params: tuple = ()) -> list:
-    conn = sqlite3.connect(db_path)
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
-
-
-def latest_verification_token(log_path, username: str, timeout: float = 5.0) -> str:
-    import time
-    pattern = re.compile(rf"verification token \(dev_mode\) for {re.escape(username)}: (\S+)")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        text = log_path.read_text(errors="replace")
-        matches = pattern.findall(text)
-        if matches:
-            return matches[-1]
-        time.sleep(0.05)
-    raise AssertionError(f"no verification token logged for {username} within {timeout}s")
 
 
 def register_and_activate(client, log_path, username, email, password=PASSWORD):

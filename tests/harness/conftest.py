@@ -5,9 +5,12 @@ gives tests an httpx client talking real TLS to a real process -- no mocks,
 no test-only build variant.
 """
 import base64
+import contextlib
 import os
+import re
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import time
@@ -168,3 +171,59 @@ def client(service):
     base_url, cert_path = service
     with make_client(base_url, cert_path) as c:
         yield c
+
+
+@contextlib.contextmanager
+def launch(built_binary, tmp_path_factory, name, env_overrides=None):
+    """A dedicated, single-test instance -- for tests that need to inspect
+    their own database directly or that mutate account/session state in
+    ways that must not leak into other tests sharing the session-scoped
+    `service` fixture (registration, login, lockout, session rotation...).
+    Yields (base_url, cert_path, db_path, log_path)."""
+    work_dir = tmp_path_factory.mktemp(name)
+    cert_path, key_path = generate_dev_cert(work_dir)
+    port = free_port()
+    env = base_env(port, cert_path, key_path)
+    env["PS_KDF_ITERATIONS"] = "1000"  # fast hashing for test speed, not a security boundary here
+    env["PS_DEV_MODE"] = "true"  # needed for the dev_mode verification-token log line (plan 15.3)
+    if env_overrides:
+        env.update(env_overrides)
+
+    log_path = work_dir / "service.log"
+    with open(log_path, "wb") as log_file:
+        proc = subprocess.Popen(
+            [str(built_binary)], env=env, stdout=log_file, stderr=subprocess.STDOUT,
+        )
+    base_url = f"https://127.0.0.1:{port}"
+    wait_for_healthz(base_url, cert_path, proc)
+    try:
+        yield base_url, cert_path, env["PS_DB_PATH"], log_path
+    finally:
+        exit_code = stop_and_reap(proc, log_path)
+        assert exit_code == 0, (
+            f"service exited {exit_code}, expected 0; log:\n"
+            f"{log_path.read_text(errors='replace')}"
+        )
+
+
+def db_query(db_path: str, sql: str, params: tuple = ()) -> list:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def latest_verification_token(log_path, username: str, timeout: float = 5.0) -> str:
+    """Reads the dev_mode verification-link log line (plan 15.3 escape
+    hatch 2) rather than the database -- exercises that path directly, and
+    sidesteps hashing the raw token back out of its stored digest."""
+    pattern = re.compile(rf"verification token \(dev_mode\) for {re.escape(username)}: (\S+)")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        text = log_path.read_text(errors="replace")
+        matches = pattern.findall(text)
+        if matches:
+            return matches[-1]
+        time.sleep(0.05)
+    raise AssertionError(f"no verification token logged for {username} within {timeout}s")

@@ -89,3 +89,25 @@ def test_config_flag_missing_its_path_argument_rejected(built_binary):
     result = run_cli(["--config"], env={})
     assert result.returncode != 0
     assert "requires a path argument" in result.stderr
+
+
+def test_dump_routes_needs_no_environment_at_all(built_binary):
+    """plan 8.3: the route table is static data (api/rbac.c), so this is
+    handled the same way as --help/--version -- before config load, no
+    PS_JWT_SECRET or anything else required."""
+    result = run_cli(["--dump-routes"], env={})
+    assert result.returncode == 0
+    assert result.stdout.strip() != ""
+
+
+def test_dump_routes_lists_every_route_with_a_policy_kind(built_binary):
+    result = run_cli(["--dump-routes"], env={})
+    assert result.returncode == 0
+    lines = result.stdout.strip().splitlines()
+    assert len(lines) >= 10  # every route registered as of phase 8
+    for line in lines:
+        method, path_pattern, kind, required_role = line.split("\t")
+        assert method in ("GET", "POST")
+        assert path_pattern.startswith("/")
+        assert kind in ("PUBLIC", "AUTHENTICATED", "ROLE", "SELF_OR_ROLE")
+        assert required_role in ("NONE", "USER", "ADMIN")

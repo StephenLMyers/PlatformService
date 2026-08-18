@@ -101,6 +101,27 @@ static void test_path_param_does_not_cross_segment_boundary(void)
     PS_CHECK_EQ_INT(rc, PS_ROUTE_NOT_FOUND);
 }
 
+static void test_path_traversal_style_id_does_not_match(void)
+{
+    /* plan 8.4's literal example: "/v1/users/1001/../1002" must not
+     * resolve to user 1002 (or to anything) -- five segments against a
+     * three-segment pattern never matches, regardless of what those
+     * segments happen to spell. No percent-decoding or dot-segment
+     * collapsing ever runs here (http/request.h's own header comment:
+     * percent-decoding is deliberately not performed), so this is exactly
+     * the raw bytes the parser would hand the router from the wire --
+     * unlike a real HTTP client (including this project's own Python
+     * harness's httpx), which normalizes ".." out of a URL before ever
+     * transmitting it (RFC 3986 6.2.2.3), so this specific property can
+     * only be exercised with literal bytes at this layer, not through a
+     * conforming client. */
+    ps_router_t r;
+    build_router(&r);
+
+    ps_route_match_result_t rc = do_match(&r, "GET", "/v1/users/1001/../1002", NULL, NULL);
+    PS_CHECK_EQ_INT(rc, PS_ROUTE_NOT_FOUND);
+}
+
 static void test_static_route_preferred_over_would_be_admin_list(void)
 {
     ps_router_t r;
@@ -180,6 +201,7 @@ int main(void)
     PS_RUN_TEST(test_path_param_captured);
     PS_RUN_TEST(test_path_param_does_not_match_empty_segment);
     PS_RUN_TEST(test_path_param_does_not_cross_segment_boundary);
+    PS_RUN_TEST(test_path_traversal_style_id_does_not_match);
     PS_RUN_TEST(test_static_route_preferred_over_would_be_admin_list);
     PS_RUN_TEST(test_root_path_matches_root_pattern);
     PS_RUN_TEST(test_params_get_missing_name_returns_null);
