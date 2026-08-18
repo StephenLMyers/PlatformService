@@ -40,6 +40,7 @@ ps_handler_result_t ps_health_handle_readyz(const ps_http_request_t *req,
 {
     (void)req;
     (void)params;
-    bool draining = (app_ctx != NULL && app_ctx->draining != NULL && *app_ctx->draining);
+    bool draining = (app_ctx != NULL && app_ctx->draining != NULL &&
+                     __atomic_load_n(app_ctx->draining, __ATOMIC_SEQ_CST));
     return status_body(draining ? 503 : 200, draining ? "draining" : "ok");
 }

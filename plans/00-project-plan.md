@@ -3,7 +3,22 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v2.0
+**Revision:** v2.1
+
+### Changes in v2.1 — fixed the pre-existing `server->draining` data race flagged in v2.0
+- **`server->draining` (§7.2a step 1) changed from `volatile bool` to a plain `bool` accessed
+  exclusively through `__atomic_store_n`/`__atomic_load_n` (`__ATOMIC_SEQ_CST`)** in `server.c`
+  (write, on shutdown) and `api/health_api.c` (read, on every `/readyz`), with the pointer type in
+  `ps_app_ctx_t.draining` (`api/routes.h`) updated to match. `volatile` never provided cross-thread
+  visibility in C's memory model -- only that the compiler wouldn't cache/elide the access -- which is
+  why ThreadSanitizer correctly flagged a real race between the main thread's write and a worker
+  thread's read. Mirrors the existing `ps_listener_t.stopping` pattern already established in
+  `platform/net.c`/`net.h` exactly (same builtins, same memory order, same comment convention). Two
+  plain assignments (`main.c`'s initial `server.draining = false;` and the equivalent in
+  `test_server.c`'s test fixture) are unchanged and still correct -- both happen before any worker
+  thread exists. Verified fixed by rebuilding under ThreadSanitizer and re-running
+  `tests/harness/test_readyz.py`'s drain test, the one that originally surfaced it, clean; full unit +
+  harness suites also re-run clean under TSan, ASan/UBSan, and Valgrind memcheck. See gotchas.md.
 
 ### Changes in v2.0 — phase 7 complete: login, sessions, refresh rotation, logout, password change
 - **`family_id` JWT claim added**, discussed with the user: a genuine design gap found mid-phase --

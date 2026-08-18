@@ -33,11 +33,19 @@ typedef struct {
     void                 *app_ctx;  /* passed through to dispatch unexamined */
     const ps_cors_policy_t *cors;   /* not owned; NULL = CORS off (plan 7.2a default) */
 
-    /* Set by ps_server_shutdown before anything else (plan 7.2a step 1).
+    /*
+     * Set by ps_server_shutdown before anything else (plan 7.2a step 1).
      * The caller's app_ctx typically points a ps_app_ctx_t.draining field
-     * at this, so /readyz can see it without any lock: it only ever goes
-     * false -> true, once, so a plain read is safe without one. */
-    volatile bool draining;
+     * at this, so /readyz can see it without a lock -- but "no lock" still
+     * needs an atomic access on each side for the write to become visible
+     * to another thread at all; `volatile` alone (the original approach
+     * here) promises nothing about cross-thread visibility in C, only
+     * that the compiler won't elide the access. Same pattern and rationale
+     * as platform/net.h's `stopping` field: accessed exclusively through
+     * the __atomic builtins in server.c/api/health_api.c, never read or
+     * written directly.
+     */
+    bool draining;
 } ps_server_t;
 
 /*

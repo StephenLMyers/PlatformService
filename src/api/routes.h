@@ -36,8 +36,10 @@ enum {
  */
 typedef struct {
     /* /readyz fails while true. Points at a flag ps_server_shutdown sets
-     * (plan 7.2a step 1); owned by the server, never by a handler. */
-    const volatile bool *draining;
+     * (plan 7.2a step 1); owned by the server, never by a handler. Read
+     * exclusively through __atomic_load_n (api/health_api.c) -- see
+     * server.h's comment on the field this points at. */
+    const bool *draining;
 
     /* Every handler acquires its own connection for the duration of one
      * request and releases it before returning -- never held across a

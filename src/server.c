@@ -60,7 +60,10 @@ void ps_server_run(ps_server_t *server)
 
 bool ps_server_shutdown(ps_server_t *server, int grace_period_s)
 {
-    server->draining = true; /* plan 7.2a step 1, first, before anything else */
+    /* plan 7.2a step 1, first, before anything else -- __atomic_store_n so
+     * a /readyz request on another thread is guaranteed to observe this,
+     * not just eventually see a compiler-unelided write (see server.h). */
+    __atomic_store_n(&server->draining, true, __ATOMIC_SEQ_CST);
 
     ps_listener_stop(&server->listener);
     /* Closing the listener fds is the caller's job, after it has joined its
