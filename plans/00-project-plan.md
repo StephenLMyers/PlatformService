@@ -3,7 +3,40 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v1.9
+**Revision:** v2.0
+
+### Changes in v2.0 — phase 7 complete: login, sessions, refresh rotation, logout, password change
+- **`family_id` JWT claim added**, discussed with the user: a genuine design gap found mid-phase --
+  password-change (§4.7) needs to spare "the session issuing the change" while revoking every other
+  family, and the plan's own principle for access tokens is signature-only validation, zero DB I/O.
+  Resolved by adding a 128-bit hex `family_id` claim (`auth/claims.h`) alongside `jti`, required on
+  every token from phase 7 onward. `auth/claims.c` gained `ps_claims_roles_from_names`, sharing the
+  existing role name/bitmask table with the store's role-name output rather than duplicating it.
+- **New modules**: `store/session_store.c` (session families + refresh tokens, raw SQL, no owned
+  transactions), `auth/session.c` (the rotation/reuse-detection algorithm: an atomic
+  `UPDATE ... WHERE consumed_at IS NULL` claim is what makes concurrent presentation of the same
+  refresh token resolve to exactly one winner, the other always treated as theft per §6.8).
+- **`api/auth_api.c` gains `login`/`refresh`/`logout`/`password`** (§4.4-4.7). Login and password-change
+  share one anti-enumeration shape (§7.4): the real PBKDF2 verify runs whenever a row is found --
+  including locked/unverified/disabled accounts -- and a dummy PBKDF2 pass runs when it isn't, so
+  response timing never reveals *why* a request failed, only that it did.
+- **Minimal bearer-token authentication added** (`authenticate_bearer` in `auth_api.c`): extracts
+  `Authorization: Bearer`, verifies via `ps_jwt_verify`, hands back claims. Deliberately not the RBAC
+  policy engine (phase 8) -- logout and password-change only need "prove who is asking."
+- **Account lockout (§6.9) implemented**: `store/user_store.c` gained
+  `ps_user_store_set_login_failure_state`. The failed-attempt counter increments (and the lockout
+  threshold is evaluated) only on an actual wrong-password attempt against a found, currently-unlocked
+  account -- not on a correct password against a merely-unverified one, which is a legitimate
+  credential holder, not a guessing attempt. See gotchas.md.
+- **Coverage** (unit tests + harness combined) moved from 82.7% lines / 99.5% functions / 71.9%
+  branches to 82.4% / 99.6% / 70.8%. Absolute coverage grew substantially (+547 lines, +23 functions,
+  +237 branches actually exercised, against +677 new lines added); the percentage dipped for the same
+  reason as every prior phase -- the new modules carry defensive error paths (SQL prepare failures,
+  malloc failures, semaphore contention) that need fault injection to reach.
+- **Found, not fixed**: a pre-existing ThreadSanitizer data race on `server->draining`
+  (`server.c`/`health_api.c`, both untouched since phase 6), surfaced only by running the Python
+  harness against a TSan build -- something no CI job currently does. Flagged to the user; deliberately
+  left for its own dedicated fix rather than a drive-by change bundled into this phase. See gotchas.md.
 
 ### Changes in v1.9 — phase 6 complete: registration, verification, bootstrap
 - **Rate-limiting scope for phase 6, decided with the user**: §7.7's KDF concurrency semaphore

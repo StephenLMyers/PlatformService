@@ -277,3 +277,58 @@ bool ps_user_store_update_status(sqlite3 *conn, int64_t user_id, ps_user_status_
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE;
 }
+
+bool ps_user_store_set_login_failure_state(sqlite3 *conn, int64_t user_id, int failed_logins,
+                                           int64_t locked_until, int64_t now,
+                                           char *err, size_t errlen)
+{
+    static const char *sql =
+        "UPDATE users SET failed_logins = ?, locked_until = ?, updated_at = ? WHERE user_id = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        (void)snprintf(err, errlen, "prepare login-failure-state update: %s", sqlite3_errmsg(conn));
+        return false;
+    }
+    (void)sqlite3_bind_int(stmt, 1, failed_logins);
+    if (locked_until == 0) {
+        (void)sqlite3_bind_null(stmt, 2);
+    } else {
+        (void)sqlite3_bind_int64(stmt, 2, locked_until);
+    }
+    (void)sqlite3_bind_int64(stmt, 3, now);
+    (void)sqlite3_bind_int64(stmt, 4, user_id);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        (void)snprintf(err, errlen, "update login-failure state: %s", sqlite3_errmsg(conn));
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
+bool ps_user_store_set_password(sqlite3 *conn, int64_t user_id,
+                                const unsigned char password_hash[32],
+                                const unsigned char password_salt[16], int kdf_iters,
+                                int64_t now, char *err, size_t errlen)
+{
+    static const char *sql =
+        "UPDATE users SET password_hash = ?, password_salt = ?, kdf_iters = ?, updated_at = ? "
+        "WHERE user_id = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        (void)snprintf(err, errlen, "prepare password update: %s", sqlite3_errmsg(conn));
+        return false;
+    }
+    (void)sqlite3_bind_blob(stmt, 1, password_hash, 32, SQLITE_STATIC);
+    (void)sqlite3_bind_blob(stmt, 2, password_salt, 16, SQLITE_STATIC);
+    (void)sqlite3_bind_int(stmt, 3, kdf_iters);
+    (void)sqlite3_bind_int64(stmt, 4, now);
+    (void)sqlite3_bind_int64(stmt, 5, user_id);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        (void)snprintf(err, errlen, "update user password: %s", sqlite3_errmsg(conn));
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}

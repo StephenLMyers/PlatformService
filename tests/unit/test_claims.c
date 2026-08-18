@@ -18,6 +18,8 @@ static ps_jwt_claims_t sample_claims(int64_t now)
     c.exp     = now + 900;
     memcpy(c.jti, "0123456789abcdef0123456789abcdef", PS_JWT_JTI_HEX_LEN);
     c.jti[PS_JWT_JTI_HEX_LEN] = '\0';
+    memcpy(c.family_id, "fedcba9876543210fedcba9876543210", PS_JWT_FAMILY_ID_HEX_LEN);
+    c.family_id[PS_JWT_FAMILY_ID_HEX_LEN] = '\0';
     return c;
 }
 
@@ -59,6 +61,7 @@ static void test_round_trip_preserves_all_fields(void)
     PS_CHECK_EQ_INT(parsed.nbf, written.nbf);
     PS_CHECK_EQ_INT(parsed.exp, written.exp);
     PS_CHECK_STR_EQ(parsed.jti, written.jti);
+    PS_CHECK_STR_EQ(parsed.family_id, written.family_id);
 }
 
 static void test_no_roles_round_trips_to_empty_bitmask(void)
@@ -185,7 +188,8 @@ static void test_sub_as_json_number_rejected(void)
     static const char json[] =
         "{\"iss\":\"platformservice\",\"sub\":42,\"aud\":\"platformservice-api\","
         "\"exp\":1900,\"iat\":1000,\"nbf\":1000,"
-        "\"jti\":\"0123456789abcdef0123456789abcdef\",\"roles\":[\"USER\"]}";
+        "\"jti\":\"0123456789abcdef0123456789abcdef\","
+        "\"family_id\":\"fedcba9876543210fedcba9876543210\",\"roles\":[\"USER\"]}";
     ps_jwt_claims_t    out;
     ps_claims_result_t r =
         ps_claims_parse(json, sizeof json - 1, ISSUER, AUDIENCE, 1000, 60, &out);
@@ -197,7 +201,8 @@ static void test_unrecognized_role_rejected(void)
     static const char json[] =
         "{\"iss\":\"platformservice\",\"sub\":\"42\",\"aud\":\"platformservice-api\","
         "\"exp\":1900,\"iat\":1000,\"nbf\":1000,"
-        "\"jti\":\"0123456789abcdef0123456789abcdef\",\"roles\":[\"SUPERUSER\"]}";
+        "\"jti\":\"0123456789abcdef0123456789abcdef\","
+        "\"family_id\":\"fedcba9876543210fedcba9876543210\",\"roles\":[\"SUPERUSER\"]}";
     ps_jwt_claims_t    out;
     ps_claims_result_t r =
         ps_claims_parse(json, sizeof json - 1, ISSUER, AUDIENCE, 1000, 60, &out);
@@ -208,11 +213,60 @@ static void test_wrong_length_jti_rejected(void)
 {
     static const char json[] =
         "{\"iss\":\"platformservice\",\"sub\":\"42\",\"aud\":\"platformservice-api\","
-        "\"exp\":1900,\"iat\":1000,\"nbf\":1000,\"jti\":\"tooshort\",\"roles\":[]}";
+        "\"exp\":1900,\"iat\":1000,\"nbf\":1000,\"jti\":\"tooshort\","
+        "\"family_id\":\"fedcba9876543210fedcba9876543210\",\"roles\":[]}";
     ps_jwt_claims_t    out;
     ps_claims_result_t r =
         ps_claims_parse(json, sizeof json - 1, ISSUER, AUDIENCE, 1000, 60, &out);
     PS_CHECK_EQ_INT(r, PS_CLAIMS_MALFORMED);
+}
+
+static void test_wrong_length_family_id_rejected(void)
+{
+    static const char json[] =
+        "{\"iss\":\"platformservice\",\"sub\":\"42\",\"aud\":\"platformservice-api\","
+        "\"exp\":1900,\"iat\":1000,\"nbf\":1000,"
+        "\"jti\":\"0123456789abcdef0123456789abcdef\","
+        "\"family_id\":\"tooshort\",\"roles\":[]}";
+    ps_jwt_claims_t    out;
+    ps_claims_result_t r =
+        ps_claims_parse(json, sizeof json - 1, ISSUER, AUDIENCE, 1000, 60, &out);
+    PS_CHECK_EQ_INT(r, PS_CLAIMS_MALFORMED);
+}
+
+static void test_missing_family_id_rejected(void)
+{
+    static const char json[] =
+        "{\"iss\":\"platformservice\",\"sub\":\"42\",\"aud\":\"platformservice-api\","
+        "\"exp\":1900,\"iat\":1000,\"nbf\":1000,"
+        "\"jti\":\"0123456789abcdef0123456789abcdef\",\"roles\":[]}";
+    ps_jwt_claims_t    out;
+    ps_claims_result_t r =
+        ps_claims_parse(json, sizeof json - 1, ISSUER, AUDIENCE, 1000, 60, &out);
+    PS_CHECK_EQ_INT(r, PS_CLAIMS_MALFORMED);
+}
+
+static void test_roles_from_names_maps_known_names(void)
+{
+    char names[2][32];
+    (void)snprintf(names[0], sizeof names[0], "USER");
+    (void)snprintf(names[1], sizeof names[1], "ADMIN");
+
+    PS_CHECK_EQ_INT(ps_claims_roles_from_names(names, 2), PS_JWT_ROLE_USER | PS_JWT_ROLE_ADMIN);
+    PS_CHECK_EQ_INT(ps_claims_roles_from_names(names, 1), PS_JWT_ROLE_USER);
+    PS_CHECK_EQ_INT(ps_claims_roles_from_names(names, 0), 0);
+}
+
+static void test_roles_from_names_skips_unrecognized_names(void)
+{
+    /* Unlike parse_roles (fail-closed on an untrusted token), this builds a
+     * fresh token from role names the store itself just returned -- an
+     * unrecognized one is skipped, not treated as a hard failure. */
+    char names[2][32];
+    (void)snprintf(names[0], sizeof names[0], "USER");
+    (void)snprintf(names[1], sizeof names[1], "SUPERUSER");
+
+    PS_CHECK_EQ_INT(ps_claims_roles_from_names(names, 2), PS_JWT_ROLE_USER);
 }
 
 int main(void)
@@ -231,5 +285,9 @@ int main(void)
     PS_RUN_TEST(test_sub_as_json_number_rejected);
     PS_RUN_TEST(test_unrecognized_role_rejected);
     PS_RUN_TEST(test_wrong_length_jti_rejected);
+    PS_RUN_TEST(test_wrong_length_family_id_rejected);
+    PS_RUN_TEST(test_missing_family_id_rejected);
+    PS_RUN_TEST(test_roles_from_names_maps_known_names);
+    PS_RUN_TEST(test_roles_from_names_skips_unrecognized_names);
     PS_TEST_EXIT();
 }

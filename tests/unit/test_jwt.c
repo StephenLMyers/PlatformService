@@ -20,6 +20,8 @@ static ps_jwt_claims_t sample_claims(int64_t now)
     c.exp     = now + 900;
     memcpy(c.jti, "fedcba9876543210fedcba9876543210", PS_JWT_JTI_HEX_LEN);
     c.jti[PS_JWT_JTI_HEX_LEN] = '\0';
+    memcpy(c.family_id, "0123456789abcdef0123456789abcdef", PS_JWT_FAMILY_ID_HEX_LEN);
+    c.family_id[PS_JWT_FAMILY_ID_HEX_LEN] = '\0';
     return c;
 }
 

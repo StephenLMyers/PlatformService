@@ -23,6 +23,19 @@ bool ps_routes_register(ps_router_t *router, char *err, size_t errlen)
                        PS_ROUTE_ID_RESEND_VERIFICATION, err, errlen)) {
         return false;
     }
+    if (!ps_router_add(router, "POST", "/v1/auth/login", PS_ROUTE_ID_LOGIN, err, errlen)) {
+        return false;
+    }
+    if (!ps_router_add(router, "POST", "/v1/auth/refresh", PS_ROUTE_ID_REFRESH, err, errlen)) {
+        return false;
+    }
+    if (!ps_router_add(router, "POST", "/v1/auth/logout", PS_ROUTE_ID_LOGOUT, err, errlen)) {
+        return false;
+    }
+    if (!ps_router_add(router, "POST", "/v1/auth/password", PS_ROUTE_ID_PASSWORD_CHANGE, err,
+                       errlen)) {
+        return false;
+    }
     return true;
 }
 
@@ -43,6 +56,14 @@ ps_handler_result_t ps_routes_dispatch(int route_id, const ps_http_request_t *re
         return ps_auth_handle_verify(req, params, peer_addr, ctx);
     case PS_ROUTE_ID_RESEND_VERIFICATION:
         return ps_auth_handle_resend_verification(req, params, peer_addr, ctx);
+    case PS_ROUTE_ID_LOGIN:
+        return ps_auth_handle_login(req, params, peer_addr, ctx);
+    case PS_ROUTE_ID_REFRESH:
+        return ps_auth_handle_refresh(req, params, peer_addr, ctx);
+    case PS_ROUTE_ID_LOGOUT:
+        return ps_auth_handle_logout(req, params, peer_addr, ctx);
+    case PS_ROUTE_ID_PASSWORD_CHANGE:
+        return ps_auth_handle_password_change(req, params, peer_addr, ctx);
     default: {
         /* Unreachable in practice: every route_id the router can return
          * comes from ps_routes_register above, and every one of those is

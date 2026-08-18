@@ -90,4 +90,25 @@ bool ps_user_store_get_roles(sqlite3 *conn, int64_t user_id, char out[][32], siz
 bool ps_user_store_update_status(sqlite3 *conn, int64_t user_id, ps_user_status_t status,
                                  int64_t now, char *err, size_t errlen);
 
+/*
+ * Sets failed_logins and locked_until (0 = clear to SQL NULL) and
+ * updated_at = now -- the one write both sides of login's outcome need
+ * (plan 6.9): a failed attempt on a found, not-already-locked account
+ * passes the incremented count and a nonzero locked_until only once the
+ * configured threshold is reached; any successful login passes (0, 0) to
+ * reset the counter unconditionally. Same no-SAVEPOINT-of-its-own,
+ * composes-into-a-caller-transaction shape as ps_user_store_update_status.
+ */
+bool ps_user_store_set_login_failure_state(sqlite3 *conn, int64_t user_id, int failed_logins,
+                                           int64_t locked_until, int64_t now,
+                                           char *err, size_t errlen);
+
+/* Rehashes at plan 4.7's "current kdf_iters" -- password_hash/salt/kdf_iters
+ * and updated_at all move together, atomically, so a row is never left with
+ * a hash from one iteration count and kdf_iters recording a different one. */
+bool ps_user_store_set_password(sqlite3 *conn, int64_t user_id,
+                                const unsigned char password_hash[32],
+                                const unsigned char password_salt[16], int kdf_iters,
+                                int64_t now, char *err, size_t errlen);
+
 #endif /* PS_STORE_USER_STORE_H */

@@ -294,6 +294,71 @@ static void test_locked_until_null_round_trips_as_zero(void)
     ps_db_pool_destroy(pool);
 }
 
+static void test_set_login_failure_state_sets_and_clears_locked_until(void)
+{
+    ps_db_pool_t *pool = open_fresh_pool();
+    sqlite3       *conn = ps_db_pool_acquire(pool);
+
+    ps_user_row_t row     = sample_row("jane", "jane@example.com");
+    const char   *roles[] = { "USER" };
+    char          err[256];
+    int64_t       user_id = 0;
+    PS_CHECK(ps_user_store_insert(conn, &row, roles, 1, 1700000000, &user_id, err, sizeof err) ==
+            PS_USER_INSERT_OK);
+
+    PS_CHECK(ps_user_store_set_login_failure_state(conn, user_id, 9, 0, 1700000100, err, sizeof err));
+    ps_user_row_t out;
+    PS_CHECK(ps_user_store_get_by_id(conn, user_id, &out));
+    PS_CHECK_EQ_INT(out.failed_logins, 9);
+    PS_CHECK_EQ_INT(out.locked_until, 0);
+    PS_CHECK_EQ_INT(out.updated_at, 1700000100);
+
+    PS_CHECK(ps_user_store_set_login_failure_state(conn, user_id, 10, 1700000900, 1700000200, err,
+                                                   sizeof err));
+    PS_CHECK(ps_user_store_get_by_id(conn, user_id, &out));
+    PS_CHECK_EQ_INT(out.failed_logins, 10);
+    PS_CHECK_EQ_INT(out.locked_until, 1700000900);
+
+    /* A successful login resets both back to zero/NULL. */
+    PS_CHECK(ps_user_store_set_login_failure_state(conn, user_id, 0, 0, 1700000300, err, sizeof err));
+    PS_CHECK(ps_user_store_get_by_id(conn, user_id, &out));
+    PS_CHECK_EQ_INT(out.failed_logins, 0);
+    PS_CHECK_EQ_INT(out.locked_until, 0);
+
+    ps_db_pool_release(pool, conn);
+    ps_db_pool_destroy(pool);
+}
+
+static void test_set_password_rehashes_and_bumps_updated_at(void)
+{
+    ps_db_pool_t *pool = open_fresh_pool();
+    sqlite3       *conn = ps_db_pool_acquire(pool);
+
+    ps_user_row_t row     = sample_row("kevin", "kevin@example.com");
+    const char   *roles[] = { "USER" };
+    char          err[256];
+    int64_t       user_id = 0;
+    PS_CHECK(ps_user_store_insert(conn, &row, roles, 1, 1700000000, &user_id, err, sizeof err) ==
+            PS_USER_INSERT_OK);
+
+    unsigned char new_hash[32];
+    unsigned char new_salt[16];
+    memset(new_hash, 0xEF, sizeof new_hash);
+    memset(new_salt, 0x12, sizeof new_salt);
+    PS_CHECK(ps_user_store_set_password(conn, user_id, new_hash, new_salt, 999, 1700000500, err,
+                                        sizeof err));
+
+    ps_user_row_t out;
+    PS_CHECK(ps_user_store_get_by_id(conn, user_id, &out));
+    PS_CHECK(memcmp(out.password_hash, new_hash, sizeof new_hash) == 0);
+    PS_CHECK(memcmp(out.password_salt, new_salt, sizeof new_salt) == 0);
+    PS_CHECK_EQ_INT(out.kdf_iters, 999);
+    PS_CHECK_EQ_INT(out.updated_at, 1700000500);
+
+    ps_db_pool_release(pool, conn);
+    ps_db_pool_destroy(pool);
+}
+
 int main(void)
 {
     PS_RUN_TEST(test_status_string_round_trip);
@@ -306,5 +371,7 @@ int main(void)
     PS_RUN_TEST(test_get_roles_on_user_with_no_roles_returns_empty);
     PS_RUN_TEST(test_insert_composes_into_a_larger_caller_managed_transaction);
     PS_RUN_TEST(test_locked_until_null_round_trips_as_zero);
+    PS_RUN_TEST(test_set_login_failure_state_sets_and_clears_locked_until);
+    PS_RUN_TEST(test_set_password_rehashes_and_bumps_updated_at);
     PS_TEST_EXIT();
 }

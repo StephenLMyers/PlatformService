@@ -18,11 +18,15 @@
 #include "store/db.h"
 
 enum {
-    PS_ROUTE_ID_HEALTHZ            = 1,
-    PS_ROUTE_ID_READYZ             = 2,
-    PS_ROUTE_ID_REGISTER           = 3,
-    PS_ROUTE_ID_VERIFY             = 4,
+    PS_ROUTE_ID_HEALTHZ             = 1,
+    PS_ROUTE_ID_READYZ              = 2,
+    PS_ROUTE_ID_REGISTER            = 3,
+    PS_ROUTE_ID_VERIFY              = 4,
     PS_ROUTE_ID_RESEND_VERIFICATION = 5,
+    PS_ROUTE_ID_LOGIN               = 6,
+    PS_ROUTE_ID_REFRESH             = 7,
+    PS_ROUTE_ID_LOGOUT              = 8,
+    PS_ROUTE_ID_PASSWORD_CHANGE     = 9,
 };
 
 /*

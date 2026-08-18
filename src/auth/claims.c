@@ -57,6 +57,7 @@ bool ps_claims_write(const ps_jwt_claims_t *claims, const char *issuer,
     ok = ok && obj_set_num(obj, "iat", (double)claims->iat);
     ok = ok && obj_set_num(obj, "nbf", (double)claims->nbf);
     ok = ok && obj_set_str(obj, "jti", claims->jti);
+    ok = ok && obj_set_str(obj, "family_id", claims->family_id);
 
     if (ok) {
         ps_json_value_t *roles = ps_json_new_array();
@@ -155,13 +156,16 @@ ps_claims_result_t ps_claims_parse(const char *json, size_t len,
         return PS_CLAIMS_MALFORMED;
     }
 
-    ps_json_value_t *iss_v = ps_json_object_get(v, "iss");
-    ps_json_value_t *aud_v = ps_json_object_get(v, "aud");
-    ps_json_value_t *jti_v = ps_json_object_get(v, "jti");
+    ps_json_value_t *iss_v       = ps_json_object_get(v, "iss");
+    ps_json_value_t *aud_v       = ps_json_object_get(v, "aud");
+    ps_json_value_t *jti_v       = ps_json_object_get(v, "jti");
+    ps_json_value_t *family_id_v = ps_json_object_get(v, "family_id");
     if (iss_v == NULL || ps_json_type(iss_v) != PS_JSON_STRING ||
         aud_v == NULL || ps_json_type(aud_v) != PS_JSON_STRING ||
         jti_v == NULL || ps_json_type(jti_v) != PS_JSON_STRING ||
-        ps_json_get_string_len(jti_v) != PS_JWT_JTI_HEX_LEN) {
+        ps_json_get_string_len(jti_v) != PS_JWT_JTI_HEX_LEN ||
+        family_id_v == NULL || ps_json_type(family_id_v) != PS_JSON_STRING ||
+        ps_json_get_string_len(family_id_v) != PS_JWT_FAMILY_ID_HEX_LEN) {
         ps_json_free(v);
         return PS_CLAIMS_MALFORMED;
     }
@@ -204,7 +208,23 @@ ps_claims_result_t ps_claims_parse(const char *json, size_t len,
     out->exp     = exp;
     memcpy(out->jti, ps_json_get_string(jti_v), PS_JWT_JTI_HEX_LEN);
     out->jti[PS_JWT_JTI_HEX_LEN] = '\0';
+    memcpy(out->family_id, ps_json_get_string(family_id_v), PS_JWT_FAMILY_ID_HEX_LEN);
+    out->family_id[PS_JWT_FAMILY_ID_HEX_LEN] = '\0';
 
     ps_json_free(v);
     return PS_CLAIMS_OK;
+}
+
+uint32_t ps_claims_roles_from_names(const char names[][32], size_t count)
+{
+    uint32_t roles = 0;
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = 0; j < ROLE_NAMES_COUNT; j++) {
+            if (strcmp(names[i], ROLE_NAMES[j].name) == 0) {
+                roles |= ROLE_NAMES[j].bit;
+                break;
+            }
+        }
+    }
+    return roles;
 }
