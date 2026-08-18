@@ -58,7 +58,7 @@ typedef struct {
  */
 typedef ps_handler_result_t (*ps_route_dispatch_fn)(int route_id, const ps_http_request_t *req,
                                                     const ps_route_params_t *params,
-                                                    void *app_ctx);
+                                                    const char *peer_addr, void *app_ctx);
 
 /*
  * Owns the full lifecycle of one accepted connection: applies timeouts,
@@ -68,7 +68,10 @@ typedef ps_handler_result_t (*ps_route_dispatch_fn)(int route_id, const ps_http_
  * ps_listener_accept.
  *
  * app_ctx is passed through to dispatch unexamined; conn.c has no idea
- * what it points to.
+ * what it points to. peer_addr (may be NULL) is likewise passed straight
+ * through to every dispatch call on this connection, unexamined -- it's
+ * the "address:port" ps_listener_accept captured at accept() time, for
+ * handlers that need it (e.g. an audit trail's source_ip).
  *
  * cors may be NULL (CORS off, the v1 default -- plan 7.2a): OPTIONS then
  * always returns 405, and no response ever carries an Access-Control-*
@@ -83,6 +86,7 @@ ps_conn_close_reason_t ps_conn_handle(int client_fd, SSL_CTX *tls_ctx,
                                       const ps_router_t *router,
                                       ps_route_dispatch_fn dispatch, void *app_ctx,
                                       const ps_cors_policy_t *cors,
+                                      const char *peer_addr,
                                       int *requests_served);
 
 #endif /* PS_HTTP_CONN_H */

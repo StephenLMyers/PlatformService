@@ -1,6 +1,7 @@
 #include "server.h"
 
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 typedef struct {
@@ -11,13 +12,14 @@ typedef struct {
     ps_route_dispatch_fn     dispatch;
     void                     *app_ctx;
     const ps_cors_policy_t   *cors;
+    char                     peer[PS_PEER_MAX];
 } conn_job_arg_t;
 
 static void conn_job_fn(void *arg)
 {
     conn_job_arg_t *job = arg;
-    (void)ps_conn_handle(job->client_fd, job->tls_ctx, &job->limits,
-                         job->router, job->dispatch, job->app_ctx, job->cors, NULL);
+    (void)ps_conn_handle(job->client_fd, job->tls_ctx, &job->limits, job->router,
+                         job->dispatch, job->app_ctx, job->cors, job->peer, NULL);
     free(job);
 }
 
@@ -26,8 +28,9 @@ void ps_server_run(ps_server_t *server)
     for (;;) {
         char err[256];
         int  client_fd = -1;
+        char peer[PS_PEER_MAX];
         ps_accept_result_t rc = ps_listener_accept(&server->listener, &client_fd,
-                                                    NULL, 0, err, sizeof err);
+                                                    peer, sizeof peer, err, sizeof err);
         if (rc == PS_ACCEPT_SHUTDOWN || rc == PS_ACCEPT_ERROR) {
             break;
         }
@@ -44,6 +47,7 @@ void ps_server_run(ps_server_t *server)
         job->dispatch  = server->dispatch;
         job->app_ctx   = server->app_ctx;
         job->cors      = server->cors;
+        memcpy(job->peer, peer, sizeof job->peer);
 
         if (!ps_threadpool_submit(server->pool, conn_job_fn, job)) {
             /* Queue full (plan 3.3 backpressure): reject cleanly rather

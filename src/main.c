@@ -22,9 +22,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "api/routes.h"
+#include "auth/bootstrap.h"
+#include "auth/password.h"
+#include "crypto/kdf_semaphore.h"
 #include "platform/config.h"
 #include "platform/log.h"
 #include "platform/maintenance.h"
@@ -248,6 +252,47 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* Loaded once, read-only for the rest of the process (plan 6.6). NULL
+     * is a valid ps_password_policy_check argument (breach checking
+     * skipped, length bounds still enforced), so a missing/unreadable
+     * file is a hard startup failure rather than a silent downgrade --
+     * the file is a tracked, committed asset (plan 6.6); its absence
+     * means something is wrong with the deployment, not an optional
+     * feature that's simply unavailable. */
+    ps_password_denylist_t denylist;
+    if (!ps_password_denylist_load(cfg.common_passwords_path, &denylist, err, sizeof err)) {
+        PS_ERROR("failed to load breach denylist: %s", err);
+        ps_db_pool_destroy(db_pool);
+        goto cleanup;
+    }
+
+    /* capacity 0 = one per CPU (plan 7.7: "roughly cpu_count"), the same
+     * convention as db_pool/threadpool above. */
+    ps_kdf_semaphore_t *kdf_semaphore = ps_kdf_semaphore_create(0, err, sizeof err);
+    if (kdf_semaphore == NULL) {
+        PS_ERROR("failed to create KDF semaphore: %s", err);
+        ps_password_denylist_free(&denylist);
+        ps_db_pool_destroy(db_pool);
+        goto cleanup;
+    }
+
+    /* D11: idempotent, runs every boot (not just against a fresh
+     * database) so an admin accidentally deleted can be recovered by
+     * restart -- see auth/bootstrap.h. */
+    {
+        sqlite3 *bootstrap_conn = ps_db_pool_acquire(db_pool);
+        ps_bootstrap_result_t bootstrap_result = ps_bootstrap_admin(
+            bootstrap_conn, &cfg, cfg.kdf_iterations, &denylist, time(NULL), err, sizeof err);
+        ps_db_pool_release(db_pool, bootstrap_conn);
+        if (bootstrap_result != PS_BOOTSTRAP_OK) {
+            PS_ERROR("admin bootstrap failed: %s", err);
+            ps_kdf_semaphore_destroy(kdf_semaphore);
+            ps_password_denylist_free(&denylist);
+            ps_db_pool_destroy(db_pool);
+            goto cleanup;
+        }
+    }
+
     /* Its own connection, independent of db_pool (plan 3.4) -- a slow sweep
      * must never compete with a request-handling worker for a connection. */
     ps_maintenance_t *maintenance = ps_maintenance_start(
@@ -255,6 +300,8 @@ int main(int argc, char **argv)
         cfg.maintenance_batch_size, cfg.audit_retention_days, err, sizeof err);
     if (maintenance == NULL) {
         PS_ERROR("failed to start maintenance thread: %s", err);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
@@ -267,6 +314,8 @@ int main(int argc, char **argv)
                           cfg.accept_queue_depth, err, sizeof err)) {
         PS_ERROR("failed to open listener: %s", err);
         ps_maintenance_stop(maintenance);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
@@ -276,6 +325,8 @@ int main(int argc, char **argv)
         PS_ERROR("failed to initialize TLS: %s", err);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
@@ -290,6 +341,8 @@ int main(int argc, char **argv)
         ps_tls_ctx_free(server.tls_ctx);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
@@ -302,7 +355,13 @@ int main(int argc, char **argv)
     server.conn_limits.http_limits.max_header_count       = cfg.max_header_count;
     server.conn_limits.http_limits.max_body_bytes         = cfg.max_body_bytes;
 
-    ps_app_ctx_t app_ctx = { .draining = &server.draining };
+    ps_app_ctx_t app_ctx = {
+        .draining          = &server.draining,
+        .db_pool           = db_pool,
+        .kdf_semaphore     = kdf_semaphore,
+        .password_denylist = &denylist,
+        .config            = &cfg,
+    };
     server.router   = &router;
     server.dispatch = ps_routes_dispatch;
     server.app_ctx  = &app_ctx;
@@ -316,6 +375,8 @@ int main(int argc, char **argv)
         ps_tls_ctx_free(server.tls_ctx);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
@@ -332,6 +393,8 @@ int main(int argc, char **argv)
         (void)pthread_join(acceptor_thread, NULL);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         goto cleanup;
     }
@@ -355,13 +418,16 @@ int main(int argc, char **argv)
 
     if (drained) {
         ps_tls_ctx_free(server.tls_ctx);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         PS_INFO("shutdown complete");
     } else {
         /* server.pool is deliberately left running and unfreed here -- see
-         * ps_server_shutdown's contract. db_pool is left alone for the same
-         * reason: a straggler worker could still be mid-query against one of
-         * its connections. Process exit reclaims both. */
+         * ps_server_shutdown's contract. db_pool, kdf_semaphore, and
+         * denylist are left alone for the same reason: a straggler worker
+         * could still be mid-request, using any of them. Process exit
+         * reclaims all of it. */
         PS_WARN("shutdown grace period (%ds) exceeded; exiting with work "
                 "still in flight", cfg.shutdown_grace_s);
     }

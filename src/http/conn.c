@@ -167,6 +167,7 @@ ps_conn_close_reason_t ps_conn_handle(int client_fd, SSL_CTX *tls_ctx,
                                       const ps_router_t *router,
                                       ps_route_dispatch_fn dispatch, void *app_ctx,
                                       const ps_cors_policy_t *cors,
+                                      const char *peer_addr,
                                       int *requests_served)
 {
     if (requests_served != NULL) {
@@ -273,7 +274,7 @@ ps_conn_close_reason_t ps_conn_handle(int client_fd, SSL_CTX *tls_ctx,
                                                          "path exists, method does not",
                                                          alive_if_written, &out);
             } else {
-                ps_handler_result_t result = dispatch(route_id, &req, &params, app_ctx);
+                ps_handler_result_t result = dispatch(route_id, &req, &params, peer_addr, app_ctx);
                 ps_http_response_t  resp   = {
                     .status     = result.status,
                     .keep_alive = alive_if_written,

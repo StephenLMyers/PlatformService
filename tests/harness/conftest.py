@@ -50,6 +50,13 @@ def generate_dev_cert(cert_dir: Path) -> tuple[Path, Path]:
     return cert_path, key_path
 
 
+#: Every harness-launched instance's bootstrap admin (plan 6.7) -- fixed,
+#: not secret, exists only inside a throwaway per-test database.
+BOOTSTRAP_USERNAME = "harnessadmin"
+BOOTSTRAP_EMAIL = "harnessadmin@example.test"
+BOOTSTRAP_PASSWORD = "harness bootstrap admin password"
+
+
 def base_env(port: int, cert_path: Path, key_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PS_JWT_SECRET"] = base64.b64encode(os.urandom(48)).decode()
@@ -57,6 +64,25 @@ def base_env(port: int, cert_path: Path, key_path: Path) -> dict[str, str]:
     env["PS_PORT"] = str(port)
     env["PS_TLS_CERT_PATH"] = str(cert_path)
     env["PS_TLS_KEY_PATH"] = str(key_path)
+    # Every caller already passes a per-instance work_dir via cert_path
+    # (cert_path.parent); reusing it for the database means every
+    # harness-launched instance gets its own file for free, with no new
+    # parameter. Without this, every instance defaults to the same
+    # ./data/platform.db -- harmless while only healthz/readyz existed,
+    # but register/verify now write real, uniquely-checked rows that
+    # different tests' instances would otherwise collide on.
+    env["PS_DB_PATH"] = str(cert_path.parent / "platform.db")
+    # A fresh per-test database has no administrator yet; main.c refuses to
+    # start without these on an admin-less database (plan 6.7) -- every
+    # harness-launched instance needs them, not just tests that use them.
+    env["BOOTSTRAP_ADMIN_USERNAME"] = BOOTSTRAP_USERNAME
+    env["BOOTSTRAP_ADMIN_EMAIL"] = BOOTSTRAP_EMAIL
+    env["BOOTSTRAP_ADMIN_PASSWORD"] = BOOTSTRAP_PASSWORD
+    # Real default is 600,000 (plan 6.3); every harness instance now pays
+    # this once at startup for the bootstrap admin, so keep it fast the
+    # same way tests/unit/test_password.c does -- this is test
+    # infrastructure, not a security boundary.
+    env["PS_KDF_ITERATIONS"] = "1000"
     return env
 
 

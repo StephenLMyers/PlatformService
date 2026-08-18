@@ -3,7 +3,41 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v1.8
+**Revision:** v1.9
+
+### Changes in v1.9 — phase 6 complete: registration, verification, bootstrap
+- **Rate-limiting scope for phase 6, decided with the user**: §7.7's KDF concurrency semaphore
+  (`crypto/kdf_semaphore.c`) and resend's per-email throttle (DB-backed, using the `ratelimit.resend_*`
+  config fields already present since phase 1) are built now, scoped tightly to the endpoints phase 6
+  adds. The general per-IP/global sharded limiter (`platform/ratelimit.c`, §3.5) remains entirely
+  unbuilt until phase 10, exactly as the phase table schedules it -- `register`/`login` have no per-IP
+  or global rate limit yet.
+- **`ps_user_store_insert` (phase 5) changed internally from `BEGIN`/`COMMIT` to `SAVEPOINT`/
+  `RELEASE`**, discussed with the user: SQLite transactions don't nest, so register/bootstrap couldn't
+  make the user-row insert, a verification-token insert, and an audit-log write commit atomically
+  together (§6.10) until this changed. Behavior-preserving for every existing caller and test.
+- **`peer_addr` now threads through `ps_conn_handle` and `ps_route_dispatch_fn`**, discussed with the
+  user: `audit_log.source_ip` (§5 schema) had nothing populating it since nothing captured the client
+  address past `ps_listener_accept`. `/healthz`/`/readyz`'s handler signatures are unchanged; only the
+  new auth handlers use the added parameter.
+- **`auth/password.c` gains the policy predicate** deferred from phase 4 (length bounds +
+  `data/common-passwords.txt` breach denylist, loaded once at startup into a sorted array, looked up
+  by binary search).
+- **New modules**: `auth/validate.c` (username/email validation+normalization, shared by register and
+  bootstrap), `auth/bootstrap.c` (D11 first-admin seeding, idempotent every boot), `store/token_store.c`
+  (verification tokens), `mail/mailer_outbox.c` (the plan's only mail transport, dev_outbox),
+  `crypto/sha256.c`, `crypto/kdf_semaphore.c`, `api/auth_api.c` (register/verify/resend-verification).
+- **Harness regressions caught and fixed**: every launched instance now needs `BOOTSTRAP_ADMIN_*`
+  (main.c refuses to start an admin-less DB without them) and its own `PS_DB_PATH` (previously all
+  instances silently shared `./data/platform.db`, harmless until register/verify started writing real
+  rows). See gotchas.md for the full account, including a `time(NULL)`-resolution testing pitfall in
+  the resend-throttle test.
+- **Coverage** (unit tests + harness combined) moved from 83.8% lines / 99.4% functions / 73.2%
+  branches to 82.7% / 99.5% / 71.9%. Absolute coverage grew substantially (+599 lines, +247 branches
+  actually exercised); the percentage dipped for the same reason it has each phase so far --
+  `auth_api.c`, `bootstrap.c`, and the other new modules carry defensive error-handling for conditions
+  that need fault injection to reach (malloc failure, a DB write failing mid-transaction), matching
+  the pattern already established in `db.c`, `tls.c`, and `main.c`.
 
 ### Changes in v1.8 — phase 3 memory baselines calibrated
 - **§8.5 budgets calibrated against real measurements**, captured via `tools/memprobe.py` and

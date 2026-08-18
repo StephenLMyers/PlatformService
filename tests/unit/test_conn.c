@@ -160,10 +160,12 @@ static void build_test_router(ps_router_t *r)
 }
 
 static ps_handler_result_t test_dispatch(int route_id, const ps_http_request_t *req,
-                                         const ps_route_params_t *params, void *app_ctx)
+                                         const ps_route_params_t *params,
+                                         const char *peer_addr, void *app_ctx)
 {
     (void)req;
     (void)params;
+    (void)peer_addr;
     (void)app_ctx;
 
     ps_handler_result_t result = { .status = 200, .body = NULL, .no_store = false };
@@ -212,7 +214,7 @@ static void *server_thread_fn(void *arg)
     }
 
     a->reason = ps_conn_handle(client_fd, a->tls_ctx, &a->limits, a->router,
-                               test_dispatch, NULL, a->cors, &a->served);
+                               test_dispatch, NULL, a->cors, NULL, &a->served);
     return NULL;
 }
 

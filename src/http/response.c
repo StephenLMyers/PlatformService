@@ -105,33 +105,8 @@ bool ps_http_response_write(const ps_http_response_t *resp, ps_buf_t *buf)
 bool ps_http_response_write_error(int status, const char *code, const char *message,
                                   bool keep_alive, ps_buf_t *buf)
 {
-    ps_json_value_t *inner = ps_json_new_object();
-    if (inner == NULL) {
-        return false;
-    }
-
-    ps_json_value_t *code_val = ps_json_new_string(code);
-    if (code_val == NULL || !ps_json_object_set(inner, "code", code_val)) {
-        ps_json_free(code_val);
-        ps_json_free(inner);
-        return false;
-    }
-
-    ps_json_value_t *message_val = ps_json_new_string(message);
-    if (message_val == NULL || !ps_json_object_set(inner, "message", message_val)) {
-        ps_json_free(message_val);
-        ps_json_free(inner);
-        return false;
-    }
-
-    ps_json_value_t *outer = ps_json_new_object();
+    ps_json_value_t *outer = ps_error_envelope(code, message);
     if (outer == NULL) {
-        ps_json_free(inner);
-        return false;
-    }
-    if (!ps_json_object_set(outer, "error", inner)) {
-        ps_json_free(inner);
-        ps_json_free(outer);
         return false;
     }
 
@@ -144,4 +119,38 @@ bool ps_http_response_write_error(int status, const char *code, const char *mess
     bool wrote = ps_http_response_write(&resp, buf);
     ps_json_free(outer);
     return wrote;
+}
+
+ps_json_value_t *ps_error_envelope(const char *code, const char *message)
+{
+    ps_json_value_t *inner = ps_json_new_object();
+    if (inner == NULL) {
+        return NULL;
+    }
+
+    ps_json_value_t *code_val = ps_json_new_string(code);
+    if (code_val == NULL || !ps_json_object_set(inner, "code", code_val)) {
+        ps_json_free(code_val);
+        ps_json_free(inner);
+        return NULL;
+    }
+
+    ps_json_value_t *message_val = ps_json_new_string(message);
+    if (message_val == NULL || !ps_json_object_set(inner, "message", message_val)) {
+        ps_json_free(message_val);
+        ps_json_free(inner);
+        return NULL;
+    }
+
+    ps_json_value_t *outer = ps_json_new_object();
+    if (outer == NULL) {
+        ps_json_free(inner);
+        return NULL;
+    }
+    if (!ps_json_object_set(outer, "error", inner)) {
+        ps_json_free(inner);
+        ps_json_free(outer);
+        return NULL;
+    }
+    return outer;
 }

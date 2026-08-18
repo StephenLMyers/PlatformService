@@ -240,6 +240,39 @@ static void test_get_roles_on_user_with_no_roles_returns_empty(void)
     ps_db_pool_destroy(pool);
 }
 
+static void test_insert_composes_into_a_larger_caller_managed_transaction(void)
+{
+    /* The whole reason ps_user_store_insert uses SAVEPOINT/RELEASE rather
+     * than BEGIN/COMMIT internally (plan 6.10, discussed with the user):
+     * a caller can wrap it inside its own outer transaction -- alongside a
+     * token insert and an audit write, for register/bootstrap -- and
+     * rolling back the outer transaction must undo the user row too, not
+     * just whatever the outer caller itself inserted. */
+    ps_db_pool_t *pool = open_fresh_pool();
+    sqlite3       *conn = ps_db_pool_acquire(pool);
+
+    PS_CHECK(sqlite3_exec(conn, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK);
+
+    ps_user_row_t row     = sample_row("iris", "iris@example.com");
+    const char   *roles[] = { "USER" };
+    char          err[256];
+    int64_t       user_id = 0;
+    PS_CHECK(ps_user_store_insert(conn, &row, roles, 1, 1700000000, &user_id, err, sizeof err) ==
+            PS_USER_INSERT_OK);
+
+    /* Still visible inside the same (uncommitted) outer transaction. */
+    ps_user_row_t out;
+    PS_CHECK(ps_user_store_get_by_username(conn, "iris", &out));
+
+    PS_CHECK(sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+
+    /* The outer rollback must have undone the insert too. */
+    PS_CHECK(!ps_user_store_get_by_username(conn, "iris", &out));
+
+    ps_db_pool_release(pool, conn);
+    ps_db_pool_destroy(pool);
+}
+
 static void test_locked_until_null_round_trips_as_zero(void)
 {
     ps_db_pool_t *pool = open_fresh_pool();
@@ -271,6 +304,7 @@ int main(void)
     PS_RUN_TEST(test_unknown_role_rejected_and_rolled_back);
     PS_RUN_TEST(test_multiple_roles_assigned);
     PS_RUN_TEST(test_get_roles_on_user_with_no_roles_returns_empty);
+    PS_RUN_TEST(test_insert_composes_into_a_larger_caller_managed_transaction);
     PS_RUN_TEST(test_locked_until_null_round_trips_as_zero);
     PS_TEST_EXIT();
 }

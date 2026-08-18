@@ -80,4 +80,14 @@ bool ps_user_store_get_by_email_normalized(sqlite3 *conn, const char *email_norm
 bool ps_user_store_get_roles(sqlite3 *conn, int64_t user_id, char out[][32], size_t cap,
                              size_t *out_count);
 
+/* Sets status and updated_at = now. No SAVEPOINT of its own (a single
+ * UPDATE is already atomic); composes into a caller-managed transaction
+ * the same way store/audit_store.c's writer does. Returns false only on a
+ * query failure, not on user_id not existing (sqlite3_changes() would be
+ * 0 in that case, which callers of this specific function are not
+ * expected to need to distinguish -- verify already looked the row up by
+ * its token before ever reaching this call). */
+bool ps_user_store_update_status(sqlite3 *conn, int64_t user_id, ps_user_status_t status,
+                                 int64_t now, char *err, size_t errlen);
+
 #endif /* PS_STORE_USER_STORE_H */

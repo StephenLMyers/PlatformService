@@ -63,4 +63,13 @@ bool ps_http_response_write(const ps_http_response_t *resp, ps_buf_t *buf);
 bool ps_http_response_write_error(int status, const char *code, const char *message,
                                   bool keep_alive, ps_buf_t *buf);
 
+/*
+ * Builds the same plan 4.12 envelope as a JSON value rather than writing
+ * it to a buffer -- for a route handler that needs to return an error as
+ * its ps_handler_result_t.body (http/conn.h), which conn.c writes via the
+ * normal ps_http_response_write path, not this module's own error path.
+ * Returns NULL only on allocation failure. Caller owns the result.
+ */
+ps_json_value_t *ps_error_envelope(const char *code, const char *message);
+
 #endif /* PS_HTTP_RESPONSE_H */

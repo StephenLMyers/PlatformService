@@ -46,24 +46,42 @@ static bool row_exists(sqlite3 *conn, const char *sql, const char *value)
     return exists;
 }
 
+/* SAVEPOINT/RELEASE rather than BEGIN/COMMIT: SQLite savepoints nest, so
+ * this composes correctly whether called standalone (acts as its own
+ * mini-transaction, same as before) or from inside a caller's own
+ * transaction -- e.g. register/bootstrap wrapping this together with a
+ * verification-token insert and an audit-log write so the whole state
+ * change commits or rolls back as one unit (plan 6.10). Plain BEGIN
+ * cannot nest and would fail outright in the second case. */
+#define PS_USER_INSERT_SAVEPOINT "ps_user_insert"
+
+static void rollback_insert(sqlite3 *conn)
+{
+    (void)sqlite3_exec(conn,
+                       "ROLLBACK TO " PS_USER_INSERT_SAVEPOINT ";"
+                       "RELEASE " PS_USER_INSERT_SAVEPOINT ";",
+                       NULL, NULL, NULL);
+}
+
 ps_user_insert_result_t ps_user_store_insert(sqlite3 *conn, const ps_user_row_t *row,
                                              const char *const *role_names, size_t role_count,
                                              int64_t now, int64_t *out_user_id,
                                              char *err, size_t errlen)
 {
     char *errmsg = NULL;
-    if (sqlite3_exec(conn, "BEGIN IMMEDIATE;", NULL, NULL, &errmsg) != SQLITE_OK) {
-        (void)snprintf(err, errlen, "BEGIN: %s", errmsg ? errmsg : "unknown error");
+    if (sqlite3_exec(conn, "SAVEPOINT " PS_USER_INSERT_SAVEPOINT ";", NULL, NULL, &errmsg) !=
+        SQLITE_OK) {
+        (void)snprintf(err, errlen, "SAVEPOINT: %s", errmsg ? errmsg : "unknown error");
         sqlite3_free(errmsg);
         return PS_USER_INSERT_ERROR;
     }
 
     if (row_exists(conn, "SELECT 1 FROM users WHERE username = ?", row->username)) {
-        (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        rollback_insert(conn);
         return PS_USER_INSERT_DUPLICATE_USERNAME;
     }
     if (row_exists(conn, "SELECT 1 FROM users WHERE email_normalized = ?", row->email_normalized)) {
-        (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        rollback_insert(conn);
         return PS_USER_INSERT_DUPLICATE_EMAIL;
     }
 
@@ -74,7 +92,7 @@ ps_user_insert_result_t ps_user_store_insert(sqlite3 *conn, const ps_user_row_t 
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     if (sqlite3_prepare_v2(conn, insert_sql, -1, &stmt, NULL) != SQLITE_OK) {
         (void)snprintf(err, errlen, "prepare insert: %s", sqlite3_errmsg(conn));
-        (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        rollback_insert(conn);
         return PS_USER_INSERT_ERROR;
     }
     (void)sqlite3_bind_text(stmt, 1, row->username, -1, SQLITE_STATIC);
@@ -97,7 +115,7 @@ ps_user_insert_result_t ps_user_store_insert(sqlite3 *conn, const ps_user_row_t 
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
         (void)snprintf(err, errlen, "insert user: %s", sqlite3_errmsg(conn));
-        (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+        rollback_insert(conn);
         return PS_USER_INSERT_ERROR;
     }
 
@@ -112,7 +130,7 @@ ps_user_insert_result_t ps_user_store_insert(sqlite3 *conn, const ps_user_row_t 
         sqlite3_stmt *role_stmt = NULL;
         if (sqlite3_prepare_v2(conn, role_insert_sql, -1, &role_stmt, NULL) != SQLITE_OK) {
             (void)snprintf(err, errlen, "prepare role insert: %s", sqlite3_errmsg(conn));
-            (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+            rollback_insert(conn);
             return PS_USER_INSERT_ERROR;
         }
         (void)sqlite3_bind_int64(role_stmt, 1, user_id);
@@ -121,18 +139,19 @@ ps_user_insert_result_t ps_user_store_insert(sqlite3 *conn, const ps_user_row_t 
         sqlite3_finalize(role_stmt);
         if (rc != SQLITE_DONE) {
             (void)snprintf(err, errlen, "insert user_roles: %s", sqlite3_errmsg(conn));
-            (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+            rollback_insert(conn);
             return PS_USER_INSERT_ERROR;
         }
         if (sqlite3_changes(conn) == 0) {
             (void)snprintf(err, errlen, "unknown role: %s", role_names[i]);
-            (void)sqlite3_exec(conn, "ROLLBACK;", NULL, NULL, NULL);
+            rollback_insert(conn);
             return PS_USER_INSERT_ERROR;
         }
     }
 
-    if (sqlite3_exec(conn, "COMMIT;", NULL, NULL, &errmsg) != SQLITE_OK) {
-        (void)snprintf(err, errlen, "COMMIT: %s", errmsg ? errmsg : "unknown error");
+    if (sqlite3_exec(conn, "RELEASE " PS_USER_INSERT_SAVEPOINT ";", NULL, NULL, &errmsg) !=
+        SQLITE_OK) {
+        (void)snprintf(err, errlen, "RELEASE: %s", errmsg ? errmsg : "unknown error");
         sqlite3_free(errmsg);
         return PS_USER_INSERT_ERROR;
     }
@@ -236,4 +255,25 @@ bool ps_user_store_get_roles(sqlite3 *conn, int64_t user_id, char out[][32], siz
     }
     *out_count = count;
     return true;
+}
+
+bool ps_user_store_update_status(sqlite3 *conn, int64_t user_id, ps_user_status_t status,
+                                 int64_t now, char *err, size_t errlen)
+{
+    static const char *sql = "UPDATE users SET status = ?, updated_at = ? WHERE user_id = ?";
+    sqlite3_stmt       *stmt = NULL;
+    if (sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        (void)snprintf(err, errlen, "prepare status update: %s", sqlite3_errmsg(conn));
+        return false;
+    }
+    (void)sqlite3_bind_text(stmt, 1, ps_user_status_to_string(status), -1, SQLITE_STATIC);
+    (void)sqlite3_bind_int64(stmt, 2, now);
+    (void)sqlite3_bind_int64(stmt, 3, user_id);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        (void)snprintf(err, errlen, "update user status: %s", sqlite3_errmsg(conn));
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
 }
