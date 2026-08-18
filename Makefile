@@ -170,6 +170,32 @@ fuzz-smoke: $(FUZZ_BINS)
 	done; \
 	exit $$status
 
+## fuzz-long -- 30 minutes per target (plan 8.6, 16.1), nightly-cadence CI
+## job, not part of local dev's normal loop. A crash here is a hard
+## failure (plan 8.6): libFuzzer writes the reproducer as crash-<hash> in
+## the working directory, which the CI job uploads as an artifact -- a
+## human then copies it into tests/fuzz/corpus/regressions/ and commits
+## it, turning the crash into a permanent regression test. This target
+## does not do that copy/commit itself; it only proves whether one is
+## needed.
+fuzz-long: $(FUZZ_BINS)
+	@if [ -z "$(FUZZ_BINS)" ]; then \
+	    echo "no fuzz targets in $(FUZZ_DIR)"; \
+	    exit 0; \
+	fi; \
+	status=0; \
+	for f in $(FUZZ_BINS); do \
+	    name=$$(basename $$f); \
+	    target=$${name#fuzz_}; \
+	    queue="$(FUZZ_DIR)/corpus/queue/$$target"; \
+	    mkdir -p "$$queue"; \
+	    echo "-- $$f (30min long-form) --"; \
+	    "./$$f" -max_total_time=1800 -close_fd_mask=3 \
+	        "$$queue" "$(FUZZ_DIR)/corpus/seed" "$(FUZZ_DIR)/corpus/regressions" \
+	        || status=1; \
+	done; \
+	exit $$status
+
 clean:
 	rm -rf $(BUILD_DIR)
 	@echo "cleaned"
@@ -231,6 +257,22 @@ harness:
 	$(HARNESS_VENV)/bin/pip install --quiet -r $(HARNESS_DIR)/requirements.txt
 	$(HARNESS_VENV)/bin/python3 -m pytest $(HARNESS_DIR) $(HARNESS_ARGS)
 
+## rate-limits -- throttle tests only, against real (non-dev_mode) limits
+## (plan 16.1/16.2). Every other harness test runs under dev_mode with
+## relaxed limits so xdist workers sharing 127.0.0.1 don't trip each
+## other's budgets; this is the one place production numbers are
+## actually exercised. Each test launches its own dedicated instance, so
+## there's nothing here that specifically requires serial execution --
+## still run standalone (not folded into `harness`) so it's easy to point
+## a dedicated CI job at exactly this file.
+rate-limits:
+	@if [ ! -x $(HARNESS_VENV)/bin/python3 ]; then \
+	    python3 -m venv $(HARNESS_VENV); \
+	    $(HARNESS_VENV)/bin/pip install --quiet --upgrade pip; \
+	fi
+	$(HARNESS_VENV)/bin/pip install --quiet -r $(HARNESS_DIR)/requirements.txt
+	$(HARNESS_VENV)/bin/python3 -m pytest $(HARNESS_DIR)/test_rate_limits.py $(HARNESS_ARGS)
+
 help:
 	@echo "PlatformService"
 	@echo "  make               build"
@@ -243,5 +285,7 @@ help:
 	@echo "  make test          build and run C unit tests (tests/unit/)"
 	@echo "  make fuzz          build libFuzzer targets (needs Clang; CI-only in practice)"
 	@echo "  make fuzz-smoke    run each fuzz target for 60s against the tracked corpus"
+	@echo "  make fuzz-long     run each fuzz target for 30min (nightly CI cadence)"
 	@echo "  make harness       run the Python black-box test harness (tests/harness/)"
+	@echo "  make rate-limits   run only the throttle tests, against real (non-dev_mode) limits"
 	@echo "  make clean         remove build output"

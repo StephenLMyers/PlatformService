@@ -332,6 +332,18 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* plan 3.5, 7.4: throttles register/login/password-change before any
+     * of their own (KDF-backed) work runs. */
+    ps_ratelimiter_t *ratelimiter =
+        ps_ratelimiter_create(cfg.ratelimit_max_entries, err, sizeof err);
+    if (ratelimiter == NULL) {
+        PS_ERROR("failed to create rate limiter: %s", err);
+        ps_kdf_semaphore_destroy(kdf_semaphore);
+        ps_password_denylist_free(&denylist);
+        ps_db_pool_destroy(db_pool);
+        goto cleanup;
+    }
+
     /* D11: idempotent, runs every boot (not just against a fresh
      * database) so an admin accidentally deleted can be recovered by
      * restart -- see auth/bootstrap.h. */
@@ -342,6 +354,7 @@ int main(int argc, char **argv)
         ps_db_pool_release(db_pool, bootstrap_conn);
         if (bootstrap_result != PS_BOOTSTRAP_OK) {
             PS_ERROR("admin bootstrap failed: %s", err);
+            ps_ratelimiter_destroy(ratelimiter);
             ps_kdf_semaphore_destroy(kdf_semaphore);
             ps_password_denylist_free(&denylist);
             ps_db_pool_destroy(db_pool);
@@ -356,6 +369,7 @@ int main(int argc, char **argv)
         cfg.maintenance_batch_size, cfg.audit_retention_days, err, sizeof err);
     if (maintenance == NULL) {
         PS_ERROR("failed to start maintenance thread: %s", err);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
@@ -370,6 +384,7 @@ int main(int argc, char **argv)
                           cfg.accept_queue_depth, err, sizeof err)) {
         PS_ERROR("failed to open listener: %s", err);
         ps_maintenance_stop(maintenance);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
@@ -381,6 +396,7 @@ int main(int argc, char **argv)
         PS_ERROR("failed to initialize TLS: %s", err);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
@@ -397,6 +413,7 @@ int main(int argc, char **argv)
         ps_tls_ctx_free(server.tls_ctx);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
@@ -417,6 +434,7 @@ int main(int argc, char **argv)
         .kdf_semaphore     = kdf_semaphore,
         .password_denylist = &denylist,
         .config            = &cfg,
+        .ratelimiter       = ratelimiter,
     };
     server.router   = &router;
     server.dispatch = ps_routes_dispatch;
@@ -431,6 +449,7 @@ int main(int argc, char **argv)
         ps_tls_ctx_free(server.tls_ctx);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
@@ -449,6 +468,7 @@ int main(int argc, char **argv)
         (void)pthread_join(acceptor_thread, NULL);
         ps_listener_close(&server.listener);
         ps_maintenance_stop(maintenance);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
@@ -474,16 +494,17 @@ int main(int argc, char **argv)
 
     if (drained) {
         ps_tls_ctx_free(server.tls_ctx);
+        ps_ratelimiter_destroy(ratelimiter);
         ps_kdf_semaphore_destroy(kdf_semaphore);
         ps_password_denylist_free(&denylist);
         ps_db_pool_destroy(db_pool);
         PS_INFO("shutdown complete");
     } else {
         /* server.pool is deliberately left running and unfreed here -- see
-         * ps_server_shutdown's contract. db_pool, kdf_semaphore, and
-         * denylist are left alone for the same reason: a straggler worker
-         * could still be mid-request, using any of them. Process exit
-         * reclaims all of it. */
+         * ps_server_shutdown's contract. db_pool, kdf_semaphore,
+         * ratelimiter, and denylist are left alone for the same reason: a
+         * straggler worker could still be mid-request, using any of them.
+         * Process exit reclaims all of it. */
         PS_WARN("shutdown grace period (%ds) exceeded; exiting with work "
                 "still in flight", cfg.shutdown_grace_s);
     }

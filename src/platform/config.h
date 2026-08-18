@@ -80,10 +80,18 @@ typedef struct {
     int      maintenance_batch_size;
     int      audit_retention_days;
 
-    /* ---- rate limiting (plan 3.5) ---- */
+    /* ---- rate limiting (plan 3.5, 7.4) ---- */
     int      ratelimit_max_entries;
-    int      ratelimit_login_per_minute;
-    int      ratelimit_register_per_minute;
+    int      ratelimit_login_per_minute;           /* per-IP */
+    int      ratelimit_login_username_per_minute;  /* per-username -- separate budget so the
+                                                     * two dimensions plan 7.4 names ("per-IP
+                                                     * and per-username") are independently
+                                                     * tunable/observable, matching register's
+                                                     * own per-IP/global split below */
+    int      ratelimit_register_per_minute;       /* per-IP */
+    int      ratelimit_register_global_per_minute; /* across every IP combined -- the
+                                                     * distributed-attacker case a per-IP
+                                                     * limit alone can't catch */
     int      resend_min_interval_s;
     int      resend_max_per_day;
 

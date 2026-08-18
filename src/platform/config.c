@@ -93,7 +93,9 @@ static const ps_setting_t SETTINGS[] = {
 
     { "ratelimit.max_entries",      "PS_RATELIMIT_MAX_ENTRIES",  T_INT,      FIELD(ratelimit_max_entries),      "100000",      false, false },
     { "ratelimit.login_per_minute", "PS_RATELIMIT_LOGIN",        T_INT,      FIELD(ratelimit_login_per_minute), "10",          false, false },
+    { "ratelimit.login_username_per_minute","PS_RATELIMIT_LOGIN_USERNAME", T_INT, FIELD(ratelimit_login_username_per_minute), "10", false, false },
     { "ratelimit.register_per_minute","PS_RATELIMIT_REGISTER",   T_INT,      FIELD(ratelimit_register_per_minute), "5",        false, false },
+    { "ratelimit.register_global_per_minute","PS_RATELIMIT_REGISTER_GLOBAL", T_INT, FIELD(ratelimit_register_global_per_minute), "50", false, false },
     { "ratelimit.resend_min_interval_s","PS_RESEND_MIN_INTERVAL_S", T_INT,   FIELD(resend_min_interval_s),      "60",          false, false },
     { "ratelimit.resend_max_per_day","PS_RESEND_MAX_PER_DAY",    T_INT,      FIELD(resend_max_per_day),         "5",           false, false },
 

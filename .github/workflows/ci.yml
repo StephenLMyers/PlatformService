@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # 03:00 UTC daily -- nightly cadence for fuzz-long (plan 16.1). Every
+    # other job stays on push/PR only; this trigger fires the whole
+    # workflow, so fuzz-long itself gates on github.event_name below to
+    # avoid a 30-minute-per-target job running on every push too.
+    - cron: '0 3 * * *'
 
 # Phase 2 scope: sanitizers (ASan/UBSan) and Valgrind now cover real listener/
 # TLS/thread-pool code, and a ThreadSanitizer job is added beyond plan section
@@ -160,6 +166,58 @@ jobs:
 
       - name: Build and run fuzz targets (60s each, tracked corpus)
         run: make fuzz-smoke
+
+  fuzz-long:
+    name: Fuzz long-form (nightly)
+    runs-on: ubuntu-latest
+    # Nightly only (plan 16.1) -- 30 minutes per target (90 min total) is
+    # too slow for every push/PR. workflow_dispatch also allowed, for an
+    # on-demand run without waiting for the schedule.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libssl-dev libsqlite3-dev pkg-config
+
+      - name: Build and run fuzz targets (30min each, tracked corpus)
+        run: make fuzz-long
+
+      # plan 8.6: any crash is a hard failure, and libFuzzer already wrote
+      # the reproducer to the working directory by the time make fuzz-long
+      # exits nonzero -- upload it so a human can pull it down and commit
+      # it into tests/fuzz/corpus/regressions/, turning it into a
+      # permanent unit test. This step intentionally does not commit
+      # anything itself.
+      - name: Upload crash reproducers (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-long-crashes
+          path: crash-*
+          if-no-files-found: ignore
+
+  rate-limits:
+    name: Rate limits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libssl-dev libsqlite3-dev pkg-config python3-venv
+
+      # plan 16.2: every other harness test runs under dev_mode (relaxed
+      # limits) so xdist workers sharing 127.0.0.1 don't trip each other's
+      # budgets -- this is the one job that exercises real, unrelaxed
+      # throttle enforcement. tests/harness/test_rate_limits.py launches
+      # its own dedicated instance per test, so nothing here depends on
+      # shared state; "serial" just means this job never runs under -n.
+      - name: Throttle tests (production limits)
+        run: make rate-limits
 
   harness:
     name: Python harness

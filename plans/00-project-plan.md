@@ -3,7 +3,60 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v2.3
+**Revision:** v2.4
+
+### Changes in v2.4 — phase 10 complete: hardening & documentation (final phase)
+- **New module `platform/ratelimit.c`/`.h` (§3.5, 7.4)**: a 16-way sharded, mutex-per-shard,
+  fixed-capacity token-bucket limiter with LRU eviction. Wired into `POST /v1/auth/register`
+  (per-IP + a new global bucket, `ratelimit.register_global_per_minute`), `POST /v1/auth/login`
+  (per-IP + per-username), and `POST /v1/auth/password`'s wrong-current-password path (shares
+  login's per-username bucket exactly, per §4.7: "rate-limited on the same counter as login").
+  Checked before any parsing/validation/KDF work on every guarded endpoint -- cheapest, most
+  decisive check first.
+- **Found and fixed during testing, not before shipping**: register's and login's per-IP checks
+  originally collided on one shared bucket (both keyed by the bare IP string) -- register calls made
+  purely to set up test fixtures were silently consuming login's own budget. Fixed by namespacing
+  every per-IP key by purpose (`"register-ip:"` / `"login-ip:"`); also split login's previously-single
+  `ratelimit_login_per_minute` into separate per-IP and per-username (`ratelimit_login_username_per_minute`)
+  fields, matching register's already-separate per-IP/global shape. See gotchas.md for the full account.
+- **`dev_mode`'s rate-limit relaxation (§15.2 item 2) implemented for the first time** -- previously
+  undone for anything, including resend's pre-existing throttle (§16.2's own named example of
+  production limits breaking repeated testing). A fixed, documented 20x multiplier/divisor now
+  applies at every throttle check, register/login/password-change's new limiter and resend's alike.
+  `tests/harness/conftest.py`'s shared `service` fixture now runs with `PS_DEV_MODE=true` by default.
+- **`fuzz-long` CI job added** (§16.1): 30 minutes per target, nightly cadence (new `schedule:`
+  trigger) plus `workflow_dispatch`, uploading any crash reproducer as a build artifact for a human
+  to commit into `tests/fuzz/corpus/regressions/`. `make fuzz-long` mirrors `make fuzz-smoke`'s
+  shape at 30x the duration. **Run locally end to end this phase, all three targets their full 30
+  minutes**: `http_request_parse` 403,082,951 runs, `json_parse` 33,310,047 runs, `jwt_decode`
+  240,464,200 runs -- ~677 million executions total, 0 crashes, 0 hangs, 0 sanitizer reports.
+- **`rate-limits` CI job and `make rate-limits` target added** (§16.1/16.2): the one place production
+  (non-`dev_mode`) throttle numbers are actually exercised, via `tests/harness/test_rate_limits.py`
+  specifically -- every other harness test now runs relaxed.
+- **`LICENSE` added: MIT** (user's explicit choice). **`README.md` substantially rewritten**: stale
+  "phase 1 of 10" status corrected, a new API quick-reference table (§4), a Backups section (SQLite
+  WAL-mode `.backup` guidance), rate limiting added to the security-posture list, and every new
+  `make` target documented.
+- **Clock injection (§16.4) confirmed never built, deliberately not retrofitted** -- discussed with
+  the user; documented as an accepted deviation rather than an invasive change across four
+  already-shipped phases. `platform/ratelimit.c` itself is still built testably (a real-clock public
+  wrapper over an explicit-timestamp internal function), a narrow, self-contained seam on brand-new
+  code, not the codebase-wide mechanism that was declined.
+- **`GET /v1/dev/outbox` (§15.2 item 3) and real `pytest-xdist` parallelism (§16.1) confirmed as
+  pre-existing, still-open gaps**, not touched this phase -- neither blocks anything phase 10 needed,
+  and both are documented in gotchas.md rather than folded in as scope creep.
+- **New tests**: `tests/unit/test_ratelimit.c` (token-bucket math, eviction under pressure via a
+  clock-deterministic test seam, a genuine multi-threaded TSan-covered concurrency test),
+  `tests/harness/test_rate_limits.py` (per-IP/per-username/global isolation, the dev-mode relaxation
+  factor, budget consumption by invalid requests, the shared login/password-change counter).
+- **Coverage** (unit tests + harness combined) moved from 82.7% lines / 99.6% functions / 71.0%
+  branches to 82.7% / 99.2% / 71.3%. Lines flat, branches rose (+71 branches actually covered);
+  functions dipped in percentage (+8 of 9 new functions covered, one new gap) -- precisely
+  identified as `platform/ratelimit.c`'s `destroy_partial`, the shard-init failure cleanup path,
+  reachable only by injecting a `pthread_mutex_init`/`calloc` failure. Same category of gap as every
+  prior phase's dip: defensive error-handling code that needs fault injection to reach, not a
+  behavioral regression. (`http/conn.c`'s `error_status_and_code`, the one other uncovered function,
+  predates this phase entirely -- that file is untouched here.)
 
 ### Changes in v2.3 — phase 9 complete: admin methods, count + batch list
 - **New module `api/admin_api.c`/`.h`**: `GET /v1/admin/users/count` (§4.9, a bare aggregate count)

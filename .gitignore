@@ -38,6 +38,11 @@ valgrind-*.log
 massif.out.*
 core
 core.*
+*.gcov
+*.gcda
+*.gcno
+coverage.html
+coverage-summary.md
 
 # working notes, not part of the project record
 plans/gotchas.md

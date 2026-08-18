@@ -86,6 +86,15 @@ def base_env(port: int, cert_path: Path, key_path: Path) -> dict[str, str]:
     # same way tests/unit/test_password.c does -- this is test
     # infrastructure, not a security boundary.
     env["PS_KDF_ITERATIONS"] = "1000"
+    # plan 15.2/16.2: dev_mode relaxes rate limits (register/login/
+    # password-change's general limiter, and resend's own throttle) to a
+    # documented, still-finite multiple of the production numbers --
+    # without it, tests sharing one instance (the session-scoped `service`
+    # fixture especially) trip production limits almost immediately.
+    # Authorization/validation/PII behavior is unchanged either way (plan
+    # 15.2: "must never alter" those), so this is safe for every instance,
+    # not just tests that specifically exercise dev-mode-only behavior.
+    env["PS_DEV_MODE"] = "true"
     return env
 
 
@@ -184,8 +193,8 @@ def launch(built_binary, tmp_path_factory, name, env_overrides=None):
     cert_path, key_path = generate_dev_cert(work_dir)
     port = free_port()
     env = base_env(port, cert_path, key_path)
-    env["PS_KDF_ITERATIONS"] = "1000"  # fast hashing for test speed, not a security boundary here
-    env["PS_DEV_MODE"] = "true"  # needed for the dev_mode verification-token log line (plan 15.3)
+    # base_env() already sets PS_KDF_ITERATIONS and PS_DEV_MODE (needed
+    # here for the dev_mode verification-token log line, plan 15.3).
     if env_overrides:
         env.update(env_overrides)
 
@@ -217,7 +226,11 @@ def db_query(db_path: str, sql: str, params: tuple = ()) -> list:
 def latest_verification_token(log_path, username: str, timeout: float = 5.0) -> str:
     """Reads the dev_mode verification-link log line (plan 15.3 escape
     hatch 2) rather than the database -- exercises that path directly, and
-    sidesteps hashing the raw token back out of its stored digest."""
+    sidesteps hashing the raw token back out of its stored digest. Only
+    works when the launched instance actually has PS_DEV_MODE=true (every
+    harness instance does by default -- see base_env() -- except the
+    rate-limit tests, which need it off for real throttle enforcement and
+    use verification_token_from_outbox instead)."""
     pattern = re.compile(rf"verification token \(dev_mode\) for {re.escape(username)}: (\S+)")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -227,3 +240,20 @@ def latest_verification_token(log_path, username: str, timeout: float = 5.0) -> 
             return matches[-1]
         time.sleep(0.05)
     raise AssertionError(f"no verification token logged for {username} within {timeout}s")
+
+
+def verification_token_from_outbox(db_path: str, email: str) -> str:
+    """Plan 15.3 escape hatch 1 (SQL, always available -- works even with
+    PS_DEV_MODE=false, unlike latest_verification_token's log line): reads
+    the newest dev_outbox row for email and pulls the raw token out of the
+    body text api/auth_api.c's send_verification_email writes."""
+    rows = db_query(
+        db_path, "SELECT body FROM dev_outbox WHERE to_email = ? ORDER BY id DESC LIMIT 1",
+        (email,),
+    )
+    if not rows:
+        raise AssertionError(f"no outbox entry for {email}")
+    match = re.search(r"POST /v1/auth/verify:\n\n(\S+)", rows[0][0])
+    if not match:
+        raise AssertionError(f"outbox body for {email} didn't contain a token: {rows[0][0]!r}")
+    return match.group(1)

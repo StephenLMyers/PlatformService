@@ -4,8 +4,10 @@ An extensible platform service written in C, starting with an identity module:
 user registration with email verification, JWT authentication with rotating
 refresh tokens, and role-based access control over a small set of user methods.
 
-**Status:** phase 1 of 10 — scaffolding, configuration, logging, and lifecycle.
-No listener yet; that arrives in phase 2.
+**Status:** all 10 phases complete — registration and email verification, JWT
+login with rotating/reuse-detected refresh tokens, account lockout, RBAC with
+default deny, admin user listing, rate limiting, and a full sanitizer/fuzz/
+Valgrind validation sweep.
 
 ---
 
@@ -33,6 +35,7 @@ Linux only (plan decision D2). On Windows, use WSL2 — not MSYS2 or Cygwin.
 | SQLite dev headers | 3.35+ |
 | Valgrind | for `make memcheck` |
 | Python | 3.11+, for the test harness |
+| Clang | optional — only `make fuzz`/`make fuzz-smoke`/`make fuzz-long` need it (libFuzzer is LLVM-only) |
 
 Full setup instructions, including WSL2 from scratch:
 [plans/01-setup-and-prerequisites.md](plans/01-setup-and-prerequisites.md).
@@ -135,19 +138,29 @@ first so migrations have created the schema.
 ```bash
 make fuzz         # build the libFuzzer targets
 make fuzz-smoke   # run each for 60s against the tracked corpus
+make fuzz-long    # run each for 30min (nightly CI cadence, not part of local dev's normal loop)
 ```
 
+Three targets, each taking nothing but `(const uint8_t *data, size_t len)` and
+parsing it: `http_request_parse`, `json_parse`, `jwt_decode` — the hand-written
+parsers consuming untrusted bytes off the network. Any crash, hang, or
+sanitizer report is a hard failure; the reproducer libFuzzer writes gets
+copied into `tests/fuzz/corpus/regressions/` and committed, becoming a
+permanent regression test.
+
 **Requires Clang** — libFuzzer (`-fsanitize=fuzzer`) is an LLVM feature GCC
-does not implement, so these two targets use Clang directly regardless of
-`CC`. Nothing else in this project needs Clang: every other build, test, and
-CI job is GCC-only, matching the confirmed dev toolchain. In practice this
-makes fuzzing CI-only — the `fuzz-smoke` GitHub Actions job installs Clang
-for itself; without Clang on `PATH`, `make fuzz` simply won't build here.
+does not implement, so these targets use Clang directly regardless of `CC`.
+Nothing else in this project needs Clang: every other build, test, and CI job
+is GCC-only, matching the confirmed dev toolchain. In practice this makes
+fuzzing CI-only — the `fuzz-smoke` (every push/PR) and `fuzz-long` (nightly)
+GitHub Actions jobs install Clang for themselves; without Clang on `PATH`,
+`make fuzz` simply won't build here.
 
 ### Python harness
 
 ```bash
-make harness   # black-box pytest suite against the real compiled binary
+make harness       # black-box pytest suite against the real compiled binary
+make rate-limits   # throttle tests only, against real (non-dev_mode) limits
 ```
 
 `tests/harness/` builds the real binary, launches it as a subprocess with an
@@ -163,6 +176,41 @@ samples the running process's `VmRSS`/`VmHWM` via `tools/memprobe.py`
 Linux) at idle, under concurrent connections, after a burst of sequential
 requests, and across repeated connect/disconnect cycles, gating on the
 budgets recorded in `plans/00-project-plan.md` §8.5.
+
+`tests/harness/test_rate_limits.py` (`make rate-limits`) is the one place
+production rate limits are actually exercised — every other harness test
+runs with `PS_DEV_MODE=true`, which relaxes them to a documented, still-finite
+multiple so repeated automated requests don't trip a real-world-sized budget.
+
+## API
+
+All endpoints are served over TLS. This is a quick reference — full request/
+response shapes, status codes, and design rationale are in
+[plans/00-project-plan.md](plans/00-project-plan.md) §4.
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `GET`  | `/healthz` | public | liveness |
+| `GET`  | `/readyz` | public | readiness; `503` while draining |
+| `POST` | `/v1/auth/register` | public | rate-limited (per-IP + global) |
+| `POST` | `/v1/auth/verify` | public | |
+| `POST` | `/v1/auth/resend-verification` | public | rate-limited (per-email, not just per-IP) |
+| `POST` | `/v1/auth/login` | public | rate-limited (per-IP + per-username); identical `401` for unknown/wrong-password/unverified |
+| `POST` | `/v1/auth/refresh` | refresh token in body | every call rotates; reuse of a consumed token revokes the whole session family |
+| `POST` | `/v1/auth/logout` | bearer + refresh token in body | revokes the whole session family, not just the presented token |
+| `POST` | `/v1/auth/password` | bearer | requires `current_password`; revokes every other session family |
+| `GET`  | `/v1/users/{userId}` | bearer | self or `ADMIN`; email disclosed only to the subject, never to an admin viewing someone else |
+| `GET`  | `/v1/admin/users/count` | bearer, `ADMIN` | |
+| `GET`  | `/v1/admin/users` | bearer, `ADMIN` | keyset pagination via `?after_id={n}&limit={n}`, `limit` capped at 1000 |
+
+Every non-public route is denied by default (§6.5, D10 in the plan) — a route
+with no explicit policy row is unreachable, never open. Run
+`./build/platformservice --dump-routes` to print the live policy table (method,
+path, policy kind, required role) directly from the binary.
+
+Error responses are always `{ "error": { "code": "...", "message": "..." } }`
+(§4.12); see the plan for the full code list (`BAD_REQUEST`, `UNAUTHORIZED`,
+`FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `RATE_LIMITED`, `INTERNAL`, ...).
 
 ## Layout
 
@@ -193,7 +241,38 @@ The design decisions worth knowing before reading the code:
   session family, because two parties holding one token means one is a thief.
 - **Lockout is temporary and self-clearing**, so it cannot be used as a
   denial-of-service weapon against a known username.
+- **Rate limiting is sharded and bounded**, never a single global lock or an
+  unbounded table an attacker cycling source IPs could turn into a
+  memory-exhaustion vector in its own right (16-way sharded token-bucket
+  limiter, `src/platform/ratelimit.c`, fixed capacity with LRU eviction).
+
+## Backups
+
+The database is SQLite in WAL mode: `./data/platform.db` plus its `-wal` and
+`-shm` siblings. Two safe approaches:
+
+1. **Stop the service, then copy the files.** Simplest and always correct —
+   copy all three (`platform.db`, `-wal`, `-shm`) together, or none, while the
+   process is not running.
+2. **Online backup without stopping the service**, using SQLite's own backup
+   mechanism rather than copying a live file out from under a writer:
+   ```bash
+   sqlite3 ./data/platform.db ".backup './backup/platform-$(date +%Y%m%d-%H%M%S).db'"
+   ```
+   This produces one self-contained, consistent snapshot file — no `-wal`/
+   `-shm` siblings to also capture, and safe to run while the service is
+   actively writing.
+
+**Never** `cp` a live database file directly without stopping the service or
+using `.backup` first. WAL mode means the canonical state is split across
+`platform.db` and `platform.db-wal` until the next checkpoint; copying only
+the former mid-write can produce a torn, inconsistent snapshot.
+
+**Restoring:** stop the service, replace `./data/platform.db` (removing any
+stale `-wal`/`-shm` siblings) with the backup file, start the service again —
+migrations are idempotent and will not re-run against an already-current
+schema.
 
 ## Licence
 
-Not yet chosen — see plan phase 10.
+[MIT](LICENSE).

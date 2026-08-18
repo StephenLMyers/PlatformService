@@ -1,5 +1,6 @@
 #include "api/auth_api.h"
 
+#include <inttypes.h>
 #include <string.h>
 #include <time.h>
 
@@ -17,6 +18,7 @@
 #include "mail/mailer.h"
 #include "platform/buf.h"
 #include "platform/log.h"
+#include "platform/ratelimit.h"
 #include "store/audit_store.h"
 #include "store/session_store.h"
 #include "store/token_store.h"
@@ -68,6 +70,110 @@ static void trim_into(const char *raw, char *out, size_t out_size)
     size_t n   = len < out_size - 1 ? len : out_size - 1;
     memcpy(out, start, n);
     out[n] = '\0';
+}
+
+/* ASCII-lowercases into out, bounded. Used only to build a rate-limiter
+ * key from a username -- never for the row itself, which
+ * ps_username_validate already normalizes at registration time. Login's
+ * per-username bucket and password-change's shared counter (plan 4.7:
+ * "rate-limited on the same counter as login") must land on the same key
+ * regardless of how a caller happened to type or store the username
+ * (usernames are NOCASE-collated), so both key off this lowercased form. */
+static void lowercase_into(const char *raw, char *out, size_t out_size)
+{
+    size_t i = 0;
+    for (; raw[i] != '\0' && i < out_size - 1; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        out[i] = (char)((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    }
+    out[i] = '\0';
+}
+
+/*
+ * Builds a rate-limiter key of the form "<ns>:<ip>", extracting just the
+ * IP literal from peer_addr's "host:port" or "[host]:port" form
+ * (platform/net.c's format_peer) -- keying by the full string would key
+ * every single request uniquely by its ephemeral source port, making
+ * per-IP limiting meaningless (every new TCP connection gets a fresh
+ * one). peer_addr may be NULL (http/conn.h's own contract); "unknown" is
+ * a safe, non-crashing fallback in that case, not a security hole -- it
+ * just means every peer-addr-less request (never happens in production;
+ * conn.c always supplies a real one) would share one bucket.
+ *
+ * ns namespaces the key by *purpose*, not just identity: register's and
+ * login's per-IP checks both derive from the same peer_addr for a client
+ * hitting both endpoints, so without a distinct prefix they would
+ * silently share one bucket keyed only by IP -- register's (smaller,
+ * default 5/min) budget would then throttle login's (larger, default
+ * 10/min) requests too, and vice versa, neither throttle actually
+ * measuring what it claims to. Discovered writing
+ * tests/harness/test_rate_limits.py, whose per-IP-isolation test failed
+ * until this was added -- see gotchas.md.
+ */
+static void namespaced_ip_key(const char *ns, const char *peer_addr, char *out, size_t out_size)
+{
+    char ip[PS_RATELIMIT_KEY_MAX];
+    if (peer_addr == NULL) {
+        (void)snprintf(ip, sizeof ip, "unknown");
+    } else if (peer_addr[0] == '[' && strchr(peer_addr, ']') != NULL) {
+        const char *end = strchr(peer_addr, ']');
+        size_t      len = (size_t)(end - peer_addr - 1);
+        size_t      n   = len < sizeof ip - 1 ? len : sizeof ip - 1;
+        memcpy(ip, peer_addr + 1, n);
+        ip[n] = '\0';
+    } else {
+        const char *colon = strrchr(peer_addr, ':');
+        size_t      len   = colon != NULL ? (size_t)(colon - peer_addr) : strlen(peer_addr);
+        size_t      n     = len < sizeof ip - 1 ? len : sizeof ip - 1;
+        memcpy(ip, peer_addr, n);
+        ip[n] = '\0';
+    }
+
+    /* Explicit bounded concatenation rather than snprintf("%s:%s", ...):
+     * GCC's -Wformat-truncation can't statically bound a runtime `ns`
+     * pointer against out_size and (correctly, conservatively) refuses to
+     * assume it fits, even though every call site only ever passes a
+     * short literal. */
+    size_t ns_len = strlen(ns);
+    size_t pos    = ns_len < out_size - 1 ? ns_len : out_size - 1;
+    memcpy(out, ns, pos);
+    if (pos < out_size - 1) {
+        out[pos++] = ':';
+    }
+    size_t ip_len    = strlen(ip);
+    size_t remaining = out_size - 1 - pos;
+    size_t copy_len  = ip_len < remaining ? ip_len : remaining;
+    memcpy(out + pos, ip, copy_len);
+    pos += copy_len;
+    out[pos] = '\0';
+}
+
+/*
+ * plan 15.2: dev_mode "relaxes rate limits to a documented, still-finite
+ * set" -- multiplies configured budgets and shrinks configured intervals
+ * by one fixed, documented constant, rather than disabling limiting
+ * altogether. Dev mode "must never alter authorization, token validation,
+ * password policy, or the PII boundary" (plan 15.2); the throttle's own
+ * enforcement code path is identical either way, only these numbers
+ * differ. Applies to both the general limiter (register/login/
+ * password-change, this phase) and resend's own pre-existing DB-backed
+ * throttle -- resend was the specific example plan 16.2 names for why
+ * production limits break automated/repeated testing.
+ */
+#define PS_DEV_MODE_RATE_MULTIPLIER 20
+
+static int dev_relaxed_count(const ps_config_t *cfg, int configured)
+{
+    return cfg->dev_mode ? configured * PS_DEV_MODE_RATE_MULTIPLIER : configured;
+}
+
+static int dev_relaxed_interval_s(const ps_config_t *cfg, int configured)
+{
+    if (!cfg->dev_mode) {
+        return configured;
+    }
+    int relaxed = configured / PS_DEV_MODE_RATE_MULTIPLIER;
+    return relaxed > 0 ? relaxed : 0;
 }
 
 static bool obj_set_str(ps_json_value_t *obj, const char *key, const char *val)
@@ -382,6 +488,24 @@ ps_handler_result_t ps_auth_handle_register(const ps_http_request_t *req,
                                             const char *peer_addr, const ps_app_ctx_t *app_ctx)
 {
     (void)params;
+
+    /* plan 7.4: per-IP AND global registration throttling, checked before
+     * any parsing/validation/KDF work -- cheapest, most decisive check
+     * first (plan 6.2's own ordering philosophy applied here). A global
+     * bucket exists because register has no pre-existing identity to key
+     * a per-account check on the way login does; it catches many distinct
+     * IPs each staying under their own per-IP budget. */
+    char ip_key[PS_RATELIMIT_KEY_MAX];
+    namespaced_ip_key("register-ip", peer_addr, ip_key, sizeof ip_key);
+    if (!ps_ratelimiter_allow(app_ctx->ratelimiter, ip_key,
+                              dev_relaxed_count(app_ctx->config,
+                                                app_ctx->config->ratelimit_register_per_minute)) ||
+        !ps_ratelimiter_allow(app_ctx->ratelimiter, "register:__global__",
+                              dev_relaxed_count(
+                                  app_ctx->config,
+                                  app_ctx->config->ratelimit_register_global_per_minute))) {
+        return error_result(429, "RATE_LIMITED", "too many registration attempts; try again later");
+    }
 
     char              json_err[128];
     ps_json_value_t  *body = ps_json_parse(req->body, req->body_len, json_err, sizeof json_err);
@@ -711,23 +835,28 @@ ps_handler_result_t ps_auth_handle_resend_verification(const ps_http_request_t *
         return r;
     }
 
-    /* Per-email throttle, DB-backed (plan 4.3): 1 per 60s, 5 per 24h. The
-     * general per-IP/global limiter (platform/ratelimit.c) is phase 10 --
-     * discussed with the user -- this is scoped specifically to this
-     * endpoint's own abuse vector (a third party's inbox, not this
-     * service), using the existing ratelimit.resend_* config fields. */
+    /* Per-email throttle, DB-backed (plan 4.3): 1 per 60s, 5 per 24h --
+     * scoped specifically to this endpoint's own abuse vector (a third
+     * party's inbox, not this service), distinct from the general
+     * per-IP/global limiter (platform/ratelimit.c, phase 9's login/
+     * register). dev_relaxed_interval_s/_count (plan 15.2) apply here
+     * too -- this throttle was plan 16.2's own named example of
+     * production limits breaking repeated/automated testing. */
     int64_t recent_minute = 0;
     int64_t recent_day    = 0;
-    bool    counted = ps_token_store_count_created_since(conn, user.user_id,
-                                                         now - app_ctx->config->resend_min_interval_s,
-                                                         &recent_minute) &&
+    bool    counted = ps_token_store_count_created_since(
+                    conn, user.user_id,
+                    now - dev_relaxed_interval_s(app_ctx->config,
+                                                 app_ctx->config->resend_min_interval_s),
+                    &recent_minute) &&
                     ps_token_store_count_created_since(
                         conn, user.user_id, now - 24 * 60 * 60, &recent_day);
     if (!counted) {
         ps_db_pool_release(app_ctx->db_pool, conn);
         return internal_error_result();
     }
-    if (recent_minute > 0 || recent_day >= app_ctx->config->resend_max_per_day) {
+    if (recent_minute > 0 ||
+        recent_day >= dev_relaxed_count(app_ctx->config, app_ctx->config->resend_max_per_day)) {
         audit_resend(conn, now, peer_addr, true, user.user_id, "FAILURE", "throttled");
         ps_db_pool_release(app_ctx->db_pool, conn);
         ps_handler_result_t r = { .status = 202, .body = resend_response_body(), .no_store = true };
@@ -785,6 +914,17 @@ ps_handler_result_t ps_auth_handle_login(const ps_http_request_t *req,
 {
     (void)params;
 
+    /* plan 7.4: per-IP login throttling, checked before any parsing --
+     * the per-username dimension follows once the body is parsed (plan
+     * 3.5: "per-IP and per-username login rate limiting"). */
+    char ip_key[PS_RATELIMIT_KEY_MAX];
+    namespaced_ip_key("login-ip", peer_addr, ip_key, sizeof ip_key);
+    if (!ps_ratelimiter_allow(app_ctx->ratelimiter, ip_key,
+                              dev_relaxed_count(app_ctx->config,
+                                                app_ctx->config->ratelimit_login_per_minute))) {
+        return error_result(429, "RATE_LIMITED", "too many login attempts; try again later");
+    }
+
     char             json_err[128];
     ps_json_value_t *body = ps_json_parse(req->body, req->body_len, json_err, sizeof json_err);
     if (body == NULL || ps_json_type(body) != PS_JSON_OBJECT) {
@@ -803,6 +943,19 @@ ps_handler_result_t ps_auth_handle_login(const ps_http_request_t *req,
     }
     const char *password     = ps_json_get_string(password_field);
     size_t      password_len = ps_json_get_string_len(password_field);
+
+    /* Per-username, keyed by the lowercased form so "Alice"/"alice"/
+     * "ALICE" all consume the same bucket, matching NOCASE username
+     * lookup and password-change's shared counter (below). */
+    char username_key[PS_RATELIMIT_KEY_MAX];
+    lowercase_into(raw_username, username_key, sizeof username_key);
+    if (!ps_ratelimiter_allow(
+            app_ctx->ratelimiter, username_key,
+            dev_relaxed_count(app_ctx->config,
+                              app_ctx->config->ratelimit_login_username_per_minute))) {
+        ps_json_free(body);
+        return error_result(429, "RATE_LIMITED", "too many login attempts; try again later");
+    }
 
     if (!ps_kdf_semaphore_try_acquire(app_ctx->kdf_semaphore)) {
         ps_json_free(body);
@@ -1227,12 +1380,6 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
         return error_result(400, "WEAK_PASSWORD", "password does not meet the policy requirements");
     }
 
-    if (!ps_kdf_semaphore_try_acquire(app_ctx->kdf_semaphore)) {
-        ps_json_free(body);
-        return error_result(503, "SERVICE_UNAVAILABLE",
-                            "too many concurrent password changes; try again shortly");
-    }
-
     sqlite3 *conn = ps_db_pool_acquire(app_ctx->db_pool);
 
     /* claims->user_id came from a signature-verified token, so the row is
@@ -1241,8 +1388,40 @@ ps_handler_result_t ps_auth_handle_password_change(const ps_http_request_t *req,
      * alone, and running the same dummy-hash path if the row is somehow
      * gone so this call's timing doesn't vary either way. */
     ps_user_row_t user;
-    bool          found      = ps_user_store_get_by_id(conn, claims->user_id, &user);
-    bool          current_ok = false;
+    bool          found = ps_user_store_get_by_id(conn, claims->user_id, &user);
+
+    /* plan 4.7: "rate-limited on the same counter as login" -- the same
+     * per-username bucket, keyed identically (lowercased username) so a
+     * spray of wrong-password attempts against one account shares one
+     * budget whether it arrives via login or here. Checked before the
+     * KDF-backed verification below, same "protect the expensive
+     * resource first" placement as login's own check. */
+    char username_key[PS_RATELIMIT_KEY_MAX];
+    if (found) {
+        lowercase_into(user.username, username_key, sizeof username_key);
+    } else {
+        /* Not expected -- claims->user_id came from a verified token --
+         * but the dummy-hash path below already handles it for timing;
+         * rate limiting needs *some* stable key regardless. */
+        (void)snprintf(username_key, sizeof username_key, "uid:%" PRId64, claims->user_id);
+    }
+    if (!ps_ratelimiter_allow(
+            app_ctx->ratelimiter, username_key,
+            dev_relaxed_count(app_ctx->config,
+                              app_ctx->config->ratelimit_login_username_per_minute))) {
+        ps_db_pool_release(app_ctx->db_pool, conn);
+        ps_json_free(body);
+        return error_result(429, "RATE_LIMITED", "too many attempts; try again later");
+    }
+
+    if (!ps_kdf_semaphore_try_acquire(app_ctx->kdf_semaphore)) {
+        ps_db_pool_release(app_ctx->db_pool, conn);
+        ps_json_free(body);
+        return error_result(503, "SERVICE_UNAVAILABLE",
+                            "too many concurrent password changes; try again shortly");
+    }
+
+    bool current_ok = false;
     if (found) {
         ps_password_hash_t stored;
         memcpy(stored.salt, user.password_salt, sizeof stored.salt);

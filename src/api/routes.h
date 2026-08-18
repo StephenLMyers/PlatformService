@@ -16,6 +16,7 @@
 #include "http/conn.h"
 #include "http/router.h"
 #include "platform/config.h"
+#include "platform/ratelimit.h"
 #include "store/db.h"
 
 enum {
@@ -63,6 +64,13 @@ typedef struct {
      * audience/dev_mode/...) a handler needs. Owned by main.c; outlives
      * every request. */
     const ps_config_t *config;
+
+    /* plan 3.5, 7.4: per-IP/per-username/global request throttling for
+     * register and login (and password-change's wrong-current-password
+     * path, which shares login's per-username budget -- plan 4.7). A
+     * handler that finds no tokens left returns 429 before doing any of
+     * its own (KDF-backed) work. */
+    ps_ratelimiter_t *ratelimiter;
 } ps_app_ctx_t;
 
 /* Registers every route this build serves. */
