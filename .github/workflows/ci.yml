@@ -52,6 +52,14 @@ jobs:
       - name: Starts, serves /healthz over TLS, and shuts down cleanly on SIGTERM
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+          # main.c refuses to start an admin-less database without these
+          # (plan 6.7); a fresh checkout always has an empty database.
+          BOOTSTRAP_ADMIN_USERNAME: ci-admin
+          BOOTSTRAP_ADMIN_EMAIL: ci-admin@example.test
+          BOOTSTRAP_ADMIN_PASSWORD: ci-only-not-a-real-password-000000
+          # Real default is 600,000 (plan 6.3); bootstrap pays this once at
+          # startup and the smoke test's fixed sleep shouldn't be racing it.
+          PS_KDF_ITERATIONS: "1000"
         run: |
           ./build/platformservice > run.log 2>&1 &
           pid=$!
@@ -92,6 +100,10 @@ jobs:
       - name: Starts, serves /healthz over TLS, and shuts down cleanly under ASan/UBSan
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+          BOOTSTRAP_ADMIN_USERNAME: ci-admin
+          BOOTSTRAP_ADMIN_EMAIL: ci-admin@example.test
+          BOOTSTRAP_ADMIN_PASSWORD: ci-only-not-a-real-password-000000
+          PS_KDF_ITERATIONS: "1000"
         run: |
           ./build/platformservice > run.log 2>&1 &
           pid=$!
@@ -244,6 +256,12 @@ jobs:
       - name: Leak check (listen, serve /healthz, shut down)
         env:
           PS_JWT_SECRET: ci-only-not-a-real-secret-000000000000
+          BOOTSTRAP_ADMIN_USERNAME: ci-admin
+          BOOTSTRAP_ADMIN_EMAIL: ci-admin@example.test
+          BOOTSTRAP_ADMIN_PASSWORD: ci-only-not-a-real-password-000000
+          # Real default is 600,000 (plan 6.3); under Valgrind's slowdown a
+          # full-cost bootstrap hash could outrun the fixed `sleep 2` below.
+          PS_KDF_ITERATIONS: "1000"
         run: |
           valgrind --leak-check=full \
                    --show-leak-kinds=definite,indirect \
