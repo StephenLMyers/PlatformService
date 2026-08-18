@@ -28,6 +28,55 @@ static void set_audit_source_ip(ps_audit_entry_t *entry, const char *peer_addr)
     (void)snprintf(entry->source_ip, sizeof entry->source_ip, "%s", peer_addr);
 }
 
+/*
+ * plan 4.8: two distinct serializer functions, not one with an
+ * include_email flag. A boolean parameter defaults wrong under
+ * maintenance -- someone adds a caller, omits the argument or passes the
+ * wrong one, and PII leaks silently. Two functions cannot be called
+ * ambiguously: user_write_admin below has no code path that can emit an
+ * email at all, regardless of what a future caller passes or forgets to.
+ *
+ * userId is emitted as a JSON string in both, not the bare number in plan
+ * 4.8's own illustrative example -- matching json_parse.h's documented,
+ * already-implemented, service-wide convention (a JSON number only
+ * round-trips exactly through an IEEE 754 double, which loses precision
+ * above 2^53 -- exactly the int64_t range D7 exists to support; see the
+ * JWT sub claim, which already does this). That example snippet predates
+ * the convention and was never updated.
+ */
+static ps_json_value_t *user_write_self(const ps_user_row_t *user)
+{
+    char user_id_str[32];
+    (void)snprintf(user_id_str, sizeof user_id_str, "%" PRId64, user->user_id);
+
+    ps_json_value_t *body = ps_json_new_object();
+    bool             ok   = body != NULL;
+    ok = ok && obj_set_str(body, "userId", user_id_str);
+    ok = ok && obj_set_str(body, "username", user->username);
+    ok = ok && obj_set_str(body, "email", user->email);
+    if (!ok) {
+        ps_json_free(body);
+        return NULL;
+    }
+    return body;
+}
+
+static ps_json_value_t *user_write_admin(const ps_user_row_t *user)
+{
+    char user_id_str[32];
+    (void)snprintf(user_id_str, sizeof user_id_str, "%" PRId64, user->user_id);
+
+    ps_json_value_t *body = ps_json_new_object();
+    bool             ok   = body != NULL;
+    ok = ok && obj_set_str(body, "userId", user_id_str);
+    ok = ok && obj_set_str(body, "username", user->username);
+    if (!ok) {
+        ps_json_free(body);
+        return NULL;
+    }
+    return body;
+}
+
 ps_handler_result_t ps_user_handle_get_user(const ps_http_request_t *req,
                                             const ps_route_params_t *params,
                                             const char *peer_addr,
@@ -75,29 +124,12 @@ ps_handler_result_t ps_user_handle_get_user(const ps_http_request_t *req,
 
     ps_db_pool_release(app_ctx->db_pool, conn);
 
-    /* userId as a JSON string, not a bare number, matching json_parse.h's
-     * documented service-wide convention (a JSON number only round-trips
-     * exactly through an IEEE 754 double, which loses precision above
-     * 2^53 -- exactly the int64_t range D7 exists to support). Plan 4.8's
-     * own illustrative example shows a bare number; that snippet predates
-     * this convention and was never updated, so this follows the
-     * documented, already-implemented rule (see the JWT sub claim)
-     * instead of the stale example. */
-    char user_id_str[32];
-    (void)snprintf(user_id_str, sizeof user_id_str, "%" PRId64, target.user_id);
-
-    ps_json_value_t *body = ps_json_new_object();
-    bool             ok   = body != NULL;
-    ok = ok && obj_set_str(body, "userId", user_id_str);
-    ok = ok && obj_set_str(body, "username", target.username);
-    /* plan 4.8: two views, not a conditional field -- email is present at
-     * all only when the subject is asking, never null/empty for anyone
-     * else. */
-    if (ok && is_self) {
-        ok = obj_set_str(body, "email", target.email);
-    }
-    if (!ok) {
-        ps_json_free(body);
+    /* plan 4.8: two views, not a conditional field -- which function runs
+     * is chosen once, here, at the call site; user_write_admin has no
+     * code path that could emit target.email even if this call site
+     * picked wrong. */
+    ps_json_value_t *body = is_self ? user_write_self(&target) : user_write_admin(&target);
+    if (body == NULL) {
         ps_handler_result_t r = { .status = 500, .body = NULL, .no_store = true };
         return r;
     }

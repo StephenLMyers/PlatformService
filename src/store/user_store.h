@@ -111,4 +111,38 @@ bool ps_user_store_set_password(sqlite3 *conn, int64_t user_id,
                                 const unsigned char password_salt[16], int kdf_iters,
                                 int64_t now, char *err, size_t errlen);
 
+/* plan 4.10's hard cap: limit is capped at 1000 regardless of what a
+ * caller asks for, so a fixed-size buffer of exactly this many rows is
+ * always enough -- no VLA, no heap allocation needed for a batch page. */
+#define PS_USER_LIST_MAX 1000
+
+/* The two fields plan 4.10's batch listing ever discloses -- deliberately
+ * not a full ps_user_row_t (which also carries the password hash/salt,
+ * email, etc.): a 1000-row page of full rows would needlessly triple or
+ * quadruple the memory a batch response actually needs (plan 8.5's ceiling
+ * on peak VmHWM during a 1000-row response). */
+typedef struct {
+    int64_t user_id;
+    char    username[PS_USERNAME_MAX];
+} ps_user_brief_row_t;
+
+/* Plan 4.9: a bare count, no filtering -- every user regardless of status. */
+bool ps_user_store_count(sqlite3 *conn, int64_t *out_count);
+
+/*
+ * Plan 4.10's exact keyset (seek) pagination query:
+ *   SELECT user_id, username FROM users WHERE user_id > ? ORDER BY user_id ASC LIMIT ?
+ * Never OFFSET -- keyset pagination stays O(limit) per page regardless of
+ * how deep into the table after_id points, where OFFSET would rescan and
+ * discard every row before it on every single page.
+ *
+ * Writes up to cap rows into out (ascending by user_id); limit itself is
+ * the caller's already-validated, already-clamped-to-<=cap page size, not
+ * re-clamped here. *out_count receives how many rows were actually
+ * written -- fewer than limit means this was the last page. Returns false
+ * only on a query failure.
+ */
+bool ps_user_store_list_after(sqlite3 *conn, int64_t after_id, int limit,
+                              ps_user_brief_row_t out[PS_USER_LIST_MAX], size_t *out_count);
+
 #endif /* PS_STORE_USER_STORE_H */

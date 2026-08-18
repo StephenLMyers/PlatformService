@@ -3,7 +3,44 @@
 **Status:** Draft for review
 **Date:** 2026-08-13
 **Owner:** Stephen Myers
-**Revision:** v2.2
+**Revision:** v2.3
+
+### Changes in v2.3 — phase 9 complete: admin methods, count + batch list
+- **New module `api/admin_api.c`/`.h`**: `GET /v1/admin/users/count` (§4.9, a bare aggregate count)
+  and `GET /v1/admin/users?after_id={n}&limit={n}` (§4.10, keyset/seek pagination, never `OFFSET`).
+  Both `PS_POLICY_ROLE`-gated to `ADMIN` via the phase-8 RBAC engine, no new enforcement mechanism
+  needed. `ADMIN_USER_LIST` audited on every list call with the requested page range (§6.10);
+  the count endpoint has no analogous audit event (not in §6.10's table -- an aggregate statistic,
+  not a record read).
+- **First query-string parameters this service has ever read.** `http/request.h` always exposed the
+  raw `(query, query_len)` span; nothing parsed `key=value` pairs out of it until now. A small, local,
+  static parser in `admin_api.c` (no percent-decoding needed -- both parameters are plain decimal
+  integers, same reasoning `http/request.h` already applies to path segments).
+- **`ps_parse_int64` extracted from `api/routes.c` into a shared, public function** (`api/routes.h`):
+  phase 8's private `parse_path_user_id` and phase 9's `after_id`/`limit` parsing need the identical
+  §7.3 algorithm; a second implementation risked drift. Directly unit-tested in the new
+  `tests/unit/test_routes.c` against §7.3's full boundary set.
+- **`limit <= 0` is `400 BAD_REQUEST`, discussed with the user**: the plan doesn't say what `limit=0`
+  or a negative limit means; decided against silently defaulting or returning a valid empty page,
+  since a positive page size is a precondition for keyset pagination to make forward progress at all.
+- **`GET /v1/users/{userId}` (phase 8) refactored to plan 4.8's recommended two-function serializer
+  shape** (`user_write_self()`/`user_write_admin()`), discussed with the user before starting this
+  phase -- the original single-function-with-a-branch version was correct and fully tested, but
+  diverged from an explicit plan recommendation meant to make a future PII leak structurally
+  impossible, not merely currently absent. Pure refactor; existing tests pass unmodified.
+  New `ps_user_brief_row_t`/`ps_user_store_list_after`/`ps_user_store_count` in `store/user_store.c`
+  -- the listing deliberately doesn't reuse the full `ps_user_row_t` (would carry ~15x the memory a
+  1000-row page actually needs to serialize).
+- **New tests**: `tests/unit/test_routes.c` (`ps_parse_int64`'s boundary set), `store/user_store.c`
+  count/list-pagination unit tests, two new `api/rbac.c` policy-table assertions for the real
+  `/v1/admin/*` routes, and `tests/harness/test_admin.py` -- RBAC, the PII/no-email boundary, the full
+  §7.3 input-validation boundary set for `after_id`/`limit`, `ADMIN_USER_LIST` auditing, and (using
+  the already-existing `tools/seed_users.py`) a genuine 2500-user walk proving every row is visited
+  exactly once, in strictly ascending, stable order, across three correctly-sized pages.
+- **Coverage** (unit tests + harness combined) moved from 82.6% lines / 99.6% functions / 71.1%
+  branches to 82.7% / 99.6% / 71.0% -- lines and functions held or improved slightly; branches dipped
+  a rounding-level 0.1pp even as the absolute covered-branch count grew by 72, consistent with every
+  prior phase's pattern (new defensive error paths needing fault injection to reach).
 
 ### Changes in v2.2 — phase 8 complete: RBAC policy engine, default deny, GET /v1/users/{userId}
 - **New module `api/rbac.c`/`.h`** (not `auth/rbac.c` as plan 3.2's aspirational source tree lists --

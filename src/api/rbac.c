@@ -4,13 +4,8 @@
 
 /*
  * plan 6.5's exact seven-entry public allowlist, plus the two
- * currently-authenticated routes and GET /v1/users/{userId} (plan 8's
- * scope). /v1/admin/users/count and /v1/admin/users are plan 9's job --
- * they get their own rows here once their handlers exist, not before:
- * a route with no handler has no route_id to key a row on, and adding a
- * phantom row for a route that doesn't exist yet would be worse than
- * useless (untestable, and default-deny-by-absence should mean exactly
- * what it says).
+ * authenticated routes (phase 7), GET /v1/users/{userId} (phase 8), and
+ * the two ADMIN-only admin endpoints (phase 9).
  */
 const ps_route_policy_t PS_RBAC_POLICIES[] = {
     { PS_ROUTE_ID_HEALTHZ,             "GET",  "/healthz",                     PS_POLICY_PUBLIC,        0 },
@@ -24,6 +19,10 @@ const ps_route_policy_t PS_RBAC_POLICIES[] = {
     { PS_ROUTE_ID_PASSWORD_CHANGE,     "POST", "/v1/auth/password",            PS_POLICY_AUTHENTICATED, 0 },
     { PS_ROUTE_ID_GET_USER,            "GET",  "/v1/users/{userId}",
       PS_POLICY_SELF_OR_ROLE, PS_JWT_ROLE_ADMIN },
+    { PS_ROUTE_ID_ADMIN_COUNT_USERS,   "GET",  "/v1/admin/users/count",        PS_POLICY_ROLE,
+      PS_JWT_ROLE_ADMIN },
+    { PS_ROUTE_ID_ADMIN_LIST_USERS,    "GET",  "/v1/admin/users",              PS_POLICY_ROLE,
+      PS_JWT_ROLE_ADMIN },
 };
 const size_t PS_RBAC_POLICIES_COUNT = sizeof PS_RBAC_POLICIES / sizeof PS_RBAC_POLICIES[0];
 

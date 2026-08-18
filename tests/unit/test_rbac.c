@@ -69,24 +69,28 @@ static void test_check_authenticated_passes_regardless_of_role(void)
     PS_CHECK(ps_rbac_check(policy, &admin, 0));
 }
 
-/* PS_ROUTE_ID_GET_USER is the only PS_POLICY_SELF_OR_ROLE route in v1;
- * PS_POLICY_ROLE has no route of its own yet (plan 9's admin endpoints),
- * so ps_rbac_check's ROLE branch is exercised directly against a
- * synthetic policy here rather than skipped until phase 9. */
-static const ps_route_policy_t ROLE_ONLY_POLICY = {
-    .route_id = -1, .method = "GET", .path_pattern = "/v1/admin/synthetic",
-    .kind = PS_POLICY_ROLE, .required_role = PS_JWT_ROLE_ADMIN,
-};
-
 static void test_check_role_requires_the_exact_bit(void)
 {
-    ps_jwt_claims_t admin     = make_claims(1, PS_JWT_ROLE_ADMIN);
-    ps_jwt_claims_t user_only = make_claims(1, PS_JWT_ROLE_USER);
-    ps_jwt_claims_t no_roles  = make_claims(1, 0);
+    const ps_route_policy_t *policy = ps_rbac_policy_for_route(PS_ROUTE_ID_ADMIN_COUNT_USERS);
+    ps_jwt_claims_t          admin     = make_claims(1, PS_JWT_ROLE_ADMIN);
+    ps_jwt_claims_t          user_only = make_claims(1, PS_JWT_ROLE_USER);
+    ps_jwt_claims_t          no_roles  = make_claims(1, 0);
 
-    PS_CHECK(ps_rbac_check(&ROLE_ONLY_POLICY, &admin, 0));
-    PS_CHECK(!ps_rbac_check(&ROLE_ONLY_POLICY, &user_only, 0));
-    PS_CHECK(!ps_rbac_check(&ROLE_ONLY_POLICY, &no_roles, 0));
+    PS_CHECK(ps_rbac_check(policy, &admin, 0));
+    PS_CHECK(!ps_rbac_check(policy, &user_only, 0));
+    PS_CHECK(!ps_rbac_check(policy, &no_roles, 0));
+}
+
+static void test_admin_routes_are_role_gated_to_admin(void)
+{
+    const ps_route_policy_t *count_policy = ps_rbac_policy_for_route(PS_ROUTE_ID_ADMIN_COUNT_USERS);
+    const ps_route_policy_t *list_policy  = ps_rbac_policy_for_route(PS_ROUTE_ID_ADMIN_LIST_USERS);
+    PS_CHECK(count_policy != NULL);
+    PS_CHECK(list_policy != NULL);
+    PS_CHECK_EQ_INT(count_policy->kind, PS_POLICY_ROLE);
+    PS_CHECK_EQ_INT(list_policy->kind, PS_POLICY_ROLE);
+    PS_CHECK_EQ_INT(count_policy->required_role, PS_JWT_ROLE_ADMIN);
+    PS_CHECK_EQ_INT(list_policy->required_role, PS_JWT_ROLE_ADMIN);
 }
 
 static void test_check_self_or_role_passes_on_ownership_alone(void)
@@ -124,6 +128,7 @@ int main(void)
     PS_RUN_TEST(test_check_public_always_passes);
     PS_RUN_TEST(test_check_authenticated_passes_regardless_of_role);
     PS_RUN_TEST(test_check_role_requires_the_exact_bit);
+    PS_RUN_TEST(test_admin_routes_are_role_gated_to_admin);
     PS_RUN_TEST(test_check_self_or_role_passes_on_ownership_alone);
     PS_RUN_TEST(test_check_self_or_role_passes_on_role_alone);
     PS_RUN_TEST(test_check_self_or_role_denies_neither);

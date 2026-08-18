@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "auth/password.h"
 #include "crypto/kdf_semaphore.h"
@@ -28,6 +29,8 @@ enum {
     PS_ROUTE_ID_LOGOUT              = 8,
     PS_ROUTE_ID_PASSWORD_CHANGE     = 9,
     PS_ROUTE_ID_GET_USER            = 10,
+    PS_ROUTE_ID_ADMIN_COUNT_USERS   = 11,
+    PS_ROUTE_ID_ADMIN_LIST_USERS    = 12,
 };
 
 /*
@@ -64,6 +67,18 @@ typedef struct {
 
 /* Registers every route this build serves. */
 bool ps_routes_register(ps_router_t *router, char *err, size_t errlen);
+
+/*
+ * plan 7.3's exact int64 identifier algorithm, shared by every call site
+ * that parses one from untrusted text -- the userId path parameter
+ * (dispatch's own ownership check) and admin_api.c's after_id/limit query
+ * parameters. strtoll, pre-clearing then checking errno == ERANGE; endptr
+ * must land on the terminator (rejects trailing garbage and a lone +/-,
+ * which leaves endptr unmoved); rejects empty input and leading
+ * whitespace (strtoll would otherwise silently skip past it and succeed,
+ * which the plan explicitly forbids).
+ */
+bool ps_parse_int64(const char *text, size_t len, int64_t *out);
 
 /* The ps_route_dispatch_fn implementation: switches on route_id and calls
  * the matching handler. */

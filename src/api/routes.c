@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "api/admin_api.h"
 #include "api/auth_api.h"
 #include "api/health_api.h"
 #include "api/rbac.h"
@@ -48,6 +49,14 @@ bool ps_routes_register(ps_router_t *router, char *err, size_t errlen)
     if (!ps_router_add(router, "GET", "/v1/users/{userId}", PS_ROUTE_ID_GET_USER, err, errlen)) {
         return false;
     }
+    if (!ps_router_add(router, "GET", "/v1/admin/users/count", PS_ROUTE_ID_ADMIN_COUNT_USERS, err,
+                       errlen)) {
+        return false;
+    }
+    if (!ps_router_add(router, "GET", "/v1/admin/users", PS_ROUTE_ID_ADMIN_LIST_USERS, err,
+                       errlen)) {
+        return false;
+    }
     return true;
 }
 
@@ -58,21 +67,14 @@ static ps_handler_result_t error_result(int status, const char *code, const char
     return r;
 }
 
-/*
- * plan 7.3's exact userId algorithm: strtoll, pre-clearing then checking
- * errno == ERANGE; endptr must land on the terminator (rejects trailing
- * garbage and a lone +/-, which leaves endptr unmoved); rejects empty
- * input and leading whitespace (strtoll would otherwise silently skip
- * past it and succeed, which the plan explicitly forbids).
- */
-static bool parse_path_user_id(const ps_route_param_t *param, int64_t *out)
+bool ps_parse_int64(const char *text, size_t len, int64_t *out)
 {
-    if (param == NULL || param->value_len == 0 || param->value_len >= 32) {
+    if (text == NULL || len == 0 || len >= 32) {
         return false;
     }
     char buf[32];
-    memcpy(buf, param->value, param->value_len);
-    buf[param->value_len] = '\0';
+    memcpy(buf, text, len);
+    buf[len] = '\0';
 
     if (isspace((unsigned char)buf[0])) {
         return false;
@@ -86,6 +88,14 @@ static bool parse_path_user_id(const ps_route_param_t *param, int64_t *out)
     }
     *out = (int64_t)parsed;
     return true;
+}
+
+static bool parse_path_user_id(const ps_route_param_t *param, int64_t *out)
+{
+    if (param == NULL) {
+        return false;
+    }
+    return ps_parse_int64(param->value, param->value_len, out);
 }
 
 ps_handler_result_t ps_routes_dispatch(int route_id, const ps_http_request_t *req,
@@ -152,6 +162,10 @@ ps_handler_result_t ps_routes_dispatch(int route_id, const ps_http_request_t *re
         return ps_auth_handle_password_change(req, params, peer_addr, &claims, ctx);
     case PS_ROUTE_ID_GET_USER:
         return ps_user_handle_get_user(req, params, peer_addr, &claims, target_user_id, ctx);
+    case PS_ROUTE_ID_ADMIN_COUNT_USERS:
+        return ps_admin_handle_count_users(req, params, peer_addr, &claims, ctx);
+    case PS_ROUTE_ID_ADMIN_LIST_USERS:
+        return ps_admin_handle_list_users(req, params, peer_addr, &claims, ctx);
     default: {
         /* Unreachable in practice: every route_id the router can return
          * comes from ps_routes_register above, and every one of those has

@@ -359,6 +359,89 @@ static void test_set_password_rehashes_and_bumps_updated_at(void)
     ps_db_pool_destroy(pool);
 }
 
+static int64_t insert_named_user(sqlite3 *conn, const char *username, int64_t now)
+{
+    char email[64];
+    (void)snprintf(email, sizeof email, "%s@example.com", username);
+    ps_user_row_t row     = sample_row(username, email);
+    const char   *roles[] = { "USER" };
+    char          err[256];
+    int64_t       user_id = 0;
+    PS_CHECK(ps_user_store_insert(conn, &row, roles, 1, now, &user_id, err, sizeof err) ==
+            PS_USER_INSERT_OK);
+    return user_id;
+}
+
+static void test_count_reflects_number_of_users(void)
+{
+    ps_db_pool_t *pool = open_fresh_pool();
+    sqlite3       *conn = ps_db_pool_acquire(pool);
+
+    int64_t count = -1;
+    PS_CHECK(ps_user_store_count(conn, &count));
+    PS_CHECK_EQ_INT(count, 0);
+
+    insert_named_user(conn, "countone", 1700000000);
+    insert_named_user(conn, "counttwo", 1700000000);
+    insert_named_user(conn, "countthree", 1700000000);
+
+    PS_CHECK(ps_user_store_count(conn, &count));
+    PS_CHECK_EQ_INT(count, 3);
+
+    ps_db_pool_release(pool, conn);
+    ps_db_pool_destroy(pool);
+}
+
+static void test_list_after_pages_in_ascending_order(void)
+{
+    ps_db_pool_t *pool = open_fresh_pool();
+    sqlite3       *conn = ps_db_pool_acquire(pool);
+
+    int64_t id1 = insert_named_user(conn, "pageuserone", 1700000000);
+    int64_t id2 = insert_named_user(conn, "pageusertwo", 1700000000);
+    int64_t id3 = insert_named_user(conn, "pageuserthree", 1700000000);
+    int64_t id4 = insert_named_user(conn, "pageuserfour", 1700000000);
+    int64_t id5 = insert_named_user(conn, "pageuserfive", 1700000000);
+
+    ps_user_brief_row_t page[PS_USER_LIST_MAX];
+    size_t               count = 0;
+    PS_CHECK(ps_user_store_list_after(conn, 0, 2, page, &count));
+    PS_CHECK_EQ_INT(count, 2);
+    PS_CHECK_EQ_INT(page[0].user_id, id1);
+    PS_CHECK_STR_EQ(page[0].username, "pageuserone");
+    PS_CHECK_EQ_INT(page[1].user_id, id2);
+
+    PS_CHECK(ps_user_store_list_after(conn, id2, 2, page, &count));
+    PS_CHECK_EQ_INT(count, 2);
+    PS_CHECK_EQ_INT(page[0].user_id, id3);
+    PS_CHECK_EQ_INT(page[1].user_id, id4);
+
+    /* Final, partial page. */
+    PS_CHECK(ps_user_store_list_after(conn, id4, 2, page, &count));
+    PS_CHECK_EQ_INT(count, 1);
+    PS_CHECK_EQ_INT(page[0].user_id, id5);
+    PS_CHECK_STR_EQ(page[0].username, "pageuserfive");
+
+    ps_db_pool_release(pool, conn);
+    ps_db_pool_destroy(pool);
+}
+
+static void test_list_after_beyond_last_user_returns_empty(void)
+{
+    ps_db_pool_t *pool = open_fresh_pool();
+    sqlite3       *conn = ps_db_pool_acquire(pool);
+
+    int64_t id1 = insert_named_user(conn, "onlyuser", 1700000000);
+
+    ps_user_brief_row_t page[PS_USER_LIST_MAX];
+    size_t               count = 999;
+    PS_CHECK(ps_user_store_list_after(conn, id1 + 1000, 100, page, &count));
+    PS_CHECK_EQ_INT(count, 0);
+
+    ps_db_pool_release(pool, conn);
+    ps_db_pool_destroy(pool);
+}
+
 int main(void)
 {
     PS_RUN_TEST(test_status_string_round_trip);
@@ -373,5 +456,8 @@ int main(void)
     PS_RUN_TEST(test_locked_until_null_round_trips_as_zero);
     PS_RUN_TEST(test_set_login_failure_state_sets_and_clears_locked_until);
     PS_RUN_TEST(test_set_password_rehashes_and_bumps_updated_at);
+    PS_RUN_TEST(test_count_reflects_number_of_users);
+    PS_RUN_TEST(test_list_after_pages_in_ascending_order);
+    PS_RUN_TEST(test_list_after_beyond_last_user_returns_empty);
     PS_TEST_EXIT();
 }

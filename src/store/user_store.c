@@ -332,3 +332,47 @@ bool ps_user_store_set_password(sqlite3 *conn, int64_t user_id,
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE;
 }
+
+bool ps_user_store_count(sqlite3 *conn, int64_t *out_count)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(conn, "SELECT COUNT(*) FROM users", -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool ok = sqlite3_step(stmt) == SQLITE_ROW;
+    if (ok) {
+        *out_count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool ps_user_store_list_after(sqlite3 *conn, int64_t after_id, int limit,
+                              ps_user_brief_row_t out[PS_USER_LIST_MAX], size_t *out_count)
+{
+    static const char *sql =
+        "SELECT user_id, username FROM users WHERE user_id > ? ORDER BY user_id ASC LIMIT ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    (void)sqlite3_bind_int64(stmt, 1, after_id);
+    (void)sqlite3_bind_int(stmt, 2, limit);
+
+    size_t count = 0;
+    int    rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count < PS_USER_LIST_MAX) {
+            out[count].user_id = sqlite3_column_int64(stmt, 0);
+            (void)snprintf(out[count].username, sizeof out[count].username, "%s",
+                           (const char *)sqlite3_column_text(stmt, 1));
+        }
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return false;
+    }
+    *out_count = count;
+    return true;
+}
