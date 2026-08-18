@@ -108,6 +108,13 @@ $(BUILD_DIR)/generated/schema_001_init.h: $(SRC_DIR)/store/schema/001_init.sql
 	} > $@
 
 $(BUILD_DIR)/$(SRC_DIR)/store/db.o: $(BUILD_DIR)/generated/schema_001_init.h
+# The fuzz build compiles db.c into its own separate object tree
+# ($(FUZZ_OBJ_DIR), not $(BUILD_DIR)/$(SRC_DIR)) via a different pattern
+# rule below -- it needs the same generated-header prerequisite, or a
+# from-scratch checkout (exactly what CI's fuzz-smoke job does, with no
+# prior `make`/`make test` step to generate it as a side effect) fails
+# with "generated/schema_001_init.h file not found".
+$(FUZZ_OBJ_DIR)/$(SRC_DIR)/store/db.o: $(BUILD_DIR)/generated/schema_001_init.h
 
 -include $(DEPS)
 
