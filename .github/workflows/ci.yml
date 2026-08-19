@@ -6,11 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # 03:00 UTC daily -- nightly cadence for fuzz-long (plan 16.1). Every
-    # other job stays on push/PR only; this trigger fires the whole
-    # workflow, so fuzz-long itself gates on github.event_name below to
-    # avoid a 30-minute-per-target job running on every push too.
-    - cron: '0 3 * * *'
+    # 06:00 UTC Monday == Sunday 11pm Pacific (PDT, UTC-7) -- weekly cadence
+    # for fuzz-long (plan 16.1). GitHub Actions cron is UTC-only and doesn't
+    # observe DST, so during PST (UTC-8, roughly Nov-Mar) this actually fires
+    # at 10pm Pacific rather than 11pm. Every other job stays on push/PR
+    # only; this trigger fires the whole workflow, so fuzz-long itself gates
+    # on github.event_name below to avoid a 30-minute-per-target job running
+    # on every push too.
+    - cron: '0 6 * * 1'
 
 # Phase 2 scope: sanitizers (ASan/UBSan) and Valgrind now cover real listener/
 # TLS/thread-pool code, and a ThreadSanitizer job is added beyond plan section
@@ -168,9 +171,9 @@ jobs:
         run: make fuzz-smoke
 
   fuzz-long:
-    name: Fuzz long-form (nightly)
+    name: Fuzz long-form (weekly)
     runs-on: ubuntu-latest
-    # Nightly only (plan 16.1) -- 30 minutes per target (90 min total) is
+    # Weekly only (plan 16.1) -- 30 minutes per target (90 min total) is
     # too slow for every push/PR. workflow_dispatch also allowed, for an
     # on-demand run without waiting for the schedule.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

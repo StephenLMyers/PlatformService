@@ -138,7 +138,7 @@ first so migrations have created the schema.
 ```bash
 make fuzz         # build the libFuzzer targets
 make fuzz-smoke   # run each for 60s against the tracked corpus
-make fuzz-long    # run each for 30min (nightly CI cadence, not part of local dev's normal loop)
+make fuzz-long    # run each for 30min (weekly CI cadence, not part of local dev's normal loop)
 ```
 
 Three targets, each taking nothing but `(const uint8_t *data, size_t len)` and
@@ -152,9 +152,9 @@ permanent regression test.
 does not implement, so these targets use Clang directly regardless of `CC`.
 Nothing else in this project needs Clang: every other build, test, and CI job
 is GCC-only, matching the confirmed dev toolchain. In practice this makes
-fuzzing CI-only — the `fuzz-smoke` (every push/PR) and `fuzz-long` (nightly)
-GitHub Actions jobs install Clang for themselves; without Clang on `PATH`,
-`make fuzz` simply won't build here.
+fuzzing CI-only — the `fuzz-smoke` (every push/PR) and `fuzz-long` (weekly,
+Sunday 11pm Pacific) GitHub Actions jobs install Clang for themselves;
+without Clang on `PATH`, `make fuzz` simply won't build here.
 
 ### Python harness
 
