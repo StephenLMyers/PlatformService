@@ -218,7 +218,7 @@ ps_handler_result_t ps_admin_handle_list_users(const ps_http_request_t *req,
      * row_count is 0 (after_id already at or past the end -- plan 8.2:
      * "returns an empty list, not an error"), nextAfterId echoes the
      * after_id that was queried, so a client that blindly keeps using it
-     * gets another empty, hasMore:false page rather than an undefined
+     * receives another empty, hasMore:false page rather than an undefined
      * cursor. */
     int64_t next_after_id = row_count > 0 ? rows[row_count - 1].user_id : after_id;
     char    next_after_id_str[32];

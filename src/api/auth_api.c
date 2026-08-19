@@ -94,7 +94,7 @@ static void lowercase_into(const char *raw, char *out, size_t out_size)
  * IP literal from peer_addr's "host:port" or "[host]:port" form
  * (platform/net.c's format_peer) -- keying by the full string would key
  * every single request uniquely by its ephemeral source port, making
- * per-IP limiting meaningless (every new TCP connection gets a fresh
+ * per-IP limiting meaningless (every new TCP connection receives a fresh
  * one). peer_addr may be NULL (http/conn.h's own contract); "unknown" is
  * a safe, non-crashing fallback in that case, not a security hole -- it
  * just means every peer-addr-less request (never happens in production;
